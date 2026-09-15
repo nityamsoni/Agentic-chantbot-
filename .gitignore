@@ -1,0 +1,14 @@
+.# Virtual environments
+myenv/
+venv/
+chatbot.db
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+# Byte-compiled / optimized / DLL files
+
+
+
+.env
