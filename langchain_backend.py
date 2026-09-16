@@ -9,6 +9,13 @@ import operator
 from langgraph.graph.message import add_messages
 # from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+
+
 from langchain_core.tools import tool
 import requests
 import os
@@ -20,7 +27,7 @@ load_dotenv()
 llm = HuggingFaceEndpoint(
     repo_id="deepseek-ai/DeepSeek-V4.1-Flash",
     task="text-generation",
-    provider="fireworks-ai",
+    provider="novita",
     temperature=0.7,
     huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN")
 )
