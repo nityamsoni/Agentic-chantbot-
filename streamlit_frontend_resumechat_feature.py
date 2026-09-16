@@ -1,6 +1,6 @@
 import streamlit as st
 from langchain_backend import chatbot , retrive_threads
-from langchain_core.messages import SystemMessage, HumanMessage , BaseMessage , AIMessage , ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage , BaseMessage , AIMessage, ToolMessage
 import uuid
 
 
@@ -197,7 +197,8 @@ if user_input:
 
                 # Stream ONLY assistant tokens
                 if isinstance(message_chunk, AIMessage):
-                    yield message_chunk.content
+                    if isinstance(message_chunk.content, str):
+                        yield message_chunk.content
 
         ai_message = st.write_stream(ai_only_stream())
 

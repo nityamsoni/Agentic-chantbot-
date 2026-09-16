@@ -11,17 +11,18 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.tools import tool
 import requests
-
+import os
 import sqlite3
 
 
 
 load_dotenv()
 llm = HuggingFaceEndpoint(
-    repo_id="meta-llama/Llama-3.2-3B-Instruct",
+    repo_id="deepseek-ai/DeepSeek-V4.1-Flash",
     task="text-generation",
-    provider="featherless-ai",
+    provider="fireworks-ai",
     temperature=0.7,
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN")
 )
 
 model = ChatHuggingFace(llm=llm)
@@ -30,8 +31,15 @@ model = ChatHuggingFace(llm=llm)
 
 
 # Tools
-search_tool = DuckDuckGoSearchRun(region="us-en")
+@tool
+def web_search(query: str) -> str:
+    """Search the web for a given query."""
+    try:
+        return DuckDuckGoSearchRun(region="us-en").run(query)
+    except Exception as e:
+        return f"Search failed: {e}"
 
+    
 @tool
 def calculator(first_num: float, second_num: float, operation: str) -> dict:
     """
@@ -59,31 +67,35 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 
 
 
+
 @tool
 def get_stock_price(symbol: str) -> dict:
-    """
-    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
-    using Alpha Vantage with API key in the URL.
-    """
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=H43T0WRCT38OGZ3A"
-    r = requests.get(url)
-    return r.json()
+    """..."""
+    try:
+        url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=H43T0WRCT38OGZ3A"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 
-
-tools = [search_tool, get_stock_price, calculator]
+tools = [web_search, get_stock_price, calculator]
 llm_with_tools = model.bind_tools(tools)
 
 # -------------------
 # 3. State
 # -------------------
-class ChatState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
+# class ChatState(TypedDict):
+#     messages: Annotated[list[BaseMessage], add_messages]
 
 # -------------------
 # 4. Nodes
 # -------------------
-def chat_node(state: ChatState):
+
+class WorkflowState(TypedDict):
+    messages:Annotated[list[BaseMessage],add_messages ]
+def chat_node(state: WorkflowState):
     """LLM node that may answer or request a tool call."""
     messages = state["messages"]
     response = llm_with_tools.invoke(messages)
@@ -91,8 +103,7 @@ def chat_node(state: ChatState):
 
 tool_node = ToolNode(tools)
 
-class WorkflowState(TypedDict):
-    messages:Annotated[list[BaseMessage],add_messages ]
+
     
 def chat_message(state:WorkflowState) -> WorkflowState:
        messages = state['messages']
