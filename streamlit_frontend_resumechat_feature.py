@@ -1,5 +1,5 @@
 import streamlit as st
-from langchain_backend import chatbot , retrive_threads
+from langchain_backend import chatbot , retrive_threads , ingest_pdf
 from langchain_core.messages import SystemMessage, HumanMessage , BaseMessage , AIMessage, ToolMessage
 import uuid
 
@@ -55,10 +55,19 @@ if "thread_id" not in st.session_state:
 
 if "chat_thread" not in st.session_state:
     st.session_state.chat_thread = retrive_threads()
-    add_to_chat_thread(st.session_state.thread_id)
 
 
 
+
+if "ingested_docs" not in st.session_state:
+    st.session_state["ingested_docs"] = {}
+
+add_to_chat_thread(st.session_state["thread_id"])
+
+thread_key = str(st.session_state["thread_id"])
+thread_docs = st.session_state["ingested_docs"].setdefault(thread_key, {})
+threads = st.session_state["chat_thread"][::-1]
+selected_thread = None
 
 
 
@@ -82,6 +91,31 @@ st.sidebar.title("Chat with LangGraph")
 
 if st.sidebar.button("New Conversation"):
     reser_chat()
+
+
+if thread_docs:
+    latest_doc = list(thread_docs.values())[-1]
+    st.sidebar.success(
+        f"Using `{latest_doc.get('filename')}` "
+        f"({latest_doc.get('chunks')} chunks from {latest_doc.get('documents')} pages)"
+    )
+else:
+    st.sidebar.info("No PDF indexed yet.")
+
+uploaded_pdf = st.sidebar.file_uploader("Upload a PDF for this chat", type=["pdf"])
+if uploaded_pdf:
+    if uploaded_pdf.name in thread_docs:
+        st.sidebar.info(f"`{uploaded_pdf.name}` already processed for this chat.")
+    else:
+        with st.sidebar.status("Indexing PDF…", expanded=True) as status_box:
+            summary = ingest_pdf(
+                uploaded_pdf.getvalue(),
+                thread_id=thread_key,
+                filename=uploaded_pdf.name,
+            )
+            thread_docs[uploaded_pdf.name] = summary
+            status_box.update(label="✅ PDF indexed", state="complete", expanded=False)
+
 
 st.sidebar.header("Previous Conversations")
 
@@ -181,7 +215,7 @@ if user_input:
                 config=CONFIG,
                 stream_mode="messages",
             ):
-                # Lazily create & update the SAME status container when any tool runs
+                # Lazily create & update the SAME status container w hen any tool runs
                 if isinstance(message_chunk, ToolMessage):
                     tool_name = getattr(message_chunk, "name", "tool")
                     if status_holder["box"] is None:
