@@ -13,6 +13,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_groq import ChatGroq
 
 
 
@@ -27,15 +28,12 @@ _THREAD_RETRIEVERS: Dict[str, Any] = {}
 _THREAD_METADATA: Dict[str, dict] = {}
 
 load_dotenv()
-llm = HuggingFaceEndpoint(
-    repo_id="deepseek-ai/DeepSeek-V4.1-Flash",
-    task="text-generation",
-    provider="novita",
+model = ChatGroq(
+    model="openai/gpt-oss-120b",
+    api_key=os.getenv("GROQ_API_KEY"),
     temperature=0.7,
-    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN")
 )
 
-model = ChatHuggingFace(llm=llm)
 
 
 embeddings = HuggingFaceEmbeddings(
