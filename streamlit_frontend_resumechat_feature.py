@@ -2,6 +2,10 @@ import streamlit as st
 from langchain_backend import chatbot, retrive_threads, ingest_pdf
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
+import sqlite3
+import hashlib
+import hmac
+import os
 
 
 st.set_page_config(
@@ -21,9 +25,120 @@ SUGGESTED_PROMPTS = [
     "Rewrite my project bullets to be more impactful",
 ]
 
+AUTH_DB_PATH = "auth.db"
 
-def generate_thread_id():
-    return str(uuid.uuid4())
+
+def init_auth_db():
+    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            phone TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000)
+    return f"pbkdf2_sha256$100000${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algo, iterations_str, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            # Backward compatibility for old unsalted SHA-256 hashes.
+            return hmac.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
+
+        iterations = int(iterations_str)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def register_user(name: str, email: str, phone: str, password: str) -> tuple[bool, str]:
+    name = name.strip()
+    email = normalize_email(email)
+    phone = phone.strip()
+
+    if not name:
+        return False, "Name is required."
+    if "@" not in email or "." not in email:
+        return False, "Enter a valid email."
+    if len(phone) < 7:
+        return False, "Enter a valid phone number."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+
+    try:
+        conn = sqlite3.connect(AUTH_DB_PATH)
+        conn.execute(
+            "INSERT INTO users (name, email, phone, password_hash) VALUES (?, ?, ?, ?)",
+            (name, email, phone, hash_password(password)),
+        )
+        conn.commit()
+        conn.close()
+        return True, "Registration successful. Please log in."
+    except sqlite3.IntegrityError:
+        return False, "Email already registered."
+
+
+def authenticate_user(email: str, password: str):
+    email = normalize_email(email)
+    conn = sqlite3.connect(AUTH_DB_PATH)
+    cursor = conn.execute(
+        "SELECT id, name, email, phone, password_hash FROM users WHERE email = ?",
+        (email,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    user_id, name, user_email, phone, password_hash = row
+    if not verify_password(password, password_hash):
+        return None
+
+    return {
+        "id": user_id,
+        "name": name,
+        "email": user_email,
+        "phone": phone,
+    }
+
+
+def user_thread_prefix(user_id: int) -> str:
+    return f"u{user_id}:"
+
+
+def generate_thread_id(user_id: int):
+    return f"{user_thread_prefix(user_id)}{uuid.uuid4()}"
+
+
+def is_user_thread(thread_id: str, user_id: int) -> bool:
+    return str(thread_id).startswith(user_thread_prefix(user_id))
+
+
+def get_user_threads(user_id: int):
+    all_threads = retrive_threads()
+    return [thread_id for thread_id in all_threads if is_user_thread(thread_id, user_id)]
 
 
 def build_config(thread_id):
@@ -63,8 +178,8 @@ def get_thread_title(thread_id):
     return "New conversation"
 
 
-def reset_chat():
-    thread_id = generate_thread_id()
+def reset_chat(user_id: int):
+    thread_id = generate_thread_id(user_id)
     st.session_state.thread_id = thread_id
     add_to_chat_thread(thread_id)
     st.session_state.message_history = []
@@ -96,17 +211,160 @@ def ingest_uploaded_file(uploaded_file, thread_id, thread_docs):
 if "message_history" not in st.session_state:
     st.session_state.message_history = []
 
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = generate_thread_id()
-
-if "chat_thread" not in st.session_state:
-    st.session_state.chat_thread = retrive_threads()
-
 if "ingested_docs" not in st.session_state:
     st.session_state["ingested_docs"] = {}
 
 if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
+
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+
+if "auth_mode" not in st.session_state:
+    st.session_state.auth_mode = "login"
+
+init_auth_db()
+
+if st.session_state.auth_user is None:
+    st.markdown(
+        """
+        <style>
+        .auth-title {
+            font-size: clamp(1.8rem, 2.8vw, 2.4rem);
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin: 0;
+            color: #141417;
+            text-align: center;
+        }
+        .auth-subtitle {
+            text-align: center;
+            color: #6b7280;
+            margin: 0.4rem 0 1.5rem 0;
+            font-size: 0.98rem;
+        }
+        .auth-surface {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 1rem;
+            box-shadow: 0 8px 30px rgba(16, 24, 40, 0.06);
+            margin-bottom: 1rem;
+        }
+        .auth-note {
+            text-align: center;
+            color: #6b7280;
+            font-size: 0.9rem;
+            margin-top: 0.55rem;
+        }
+        [data-testid="stForm"] {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 1rem 1rem 0.25rem 1rem;
+            box-shadow: 0 8px 28px rgba(16, 24, 40, 0.05);
+        }
+        [data-testid="stTextInput"] input {
+            border-radius: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    outer_l, center, outer_r = st.columns([1, 1.2, 1])
+    with center:
+        st.markdown('<h1 class="auth-title">Resume Chat Assistant</h1>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="auth-subtitle">Sign in to access your private conversations and uploaded resume history.</p>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<div class="auth-surface">', unsafe_allow_html=True)
+        page_cols = st.columns(2)
+        with page_cols[0]:
+            if st.button(
+                "Login",
+                use_container_width=True,
+                type="primary" if st.session_state.auth_mode == "login" else "secondary",
+            ):
+                st.session_state.auth_mode = "login"
+                st.rerun()
+        with page_cols[1]:
+            if st.button(
+                "Register",
+                use_container_width=True,
+                type="primary" if st.session_state.auth_mode == "register" else "secondary",
+            ):
+                st.session_state.auth_mode = "register"
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if st.session_state.auth_mode == "login":
+            st.subheader("Login")
+            with st.form("login_form", clear_on_submit=False):
+                login_email = st.text_input("Email", key="login_email", placeholder="you@example.com")
+                login_password = st.text_input("Password", type="password", key="login_password", placeholder="Enter password")
+                login_submit = st.form_submit_button("Login", use_container_width=True)
+
+            if login_submit:
+                user = authenticate_user(login_email, login_password)
+                if user is None:
+                    st.error("Invalid email or password.")
+                else:
+                    st.session_state.auth_user = user
+                    st.session_state.chat_thread = get_user_threads(user["id"])
+                    if st.session_state.chat_thread:
+                        st.session_state.thread_id = st.session_state.chat_thread[-1]
+                    else:
+                        st.session_state.thread_id = generate_thread_id(user["id"])
+                        st.session_state.chat_thread = [st.session_state.thread_id]
+                    st.session_state.message_history = []
+                    st.rerun()
+
+            st.markdown('<p class="auth-note">Don\'t have an account? Switch to Register.</p>', unsafe_allow_html=True)
+        else:
+            st.subheader("Register")
+            with st.form("register_form", clear_on_submit=True):
+                reg_name = st.text_input("Name", placeholder="Your full name")
+                reg_email = st.text_input("Email", placeholder="you@example.com")
+                reg_phone = st.text_input("Phone number", placeholder="e.g. +91 9876543210")
+                reg_password = st.text_input("Password", type="password", placeholder="At least 6 characters")
+                reg_submit = st.form_submit_button("Create account", use_container_width=True)
+
+            if reg_submit:
+                ok, msg = register_user(reg_name, reg_email, reg_phone, reg_password)
+                if ok:
+                    st.success(msg)
+                    st.session_state.auth_mode = "login"
+                else:
+                    st.error(msg)
+
+            st.markdown('<p class="auth-note">Already registered? Switch to Login.</p>', unsafe_allow_html=True)
+
+    st.stop()
+
+current_user = st.session_state.auth_user
+current_user_id = current_user["id"]
+
+if "chat_thread" not in st.session_state:
+    st.session_state.chat_thread = get_user_threads(current_user_id)
+
+if "thread_id" not in st.session_state or not is_user_thread(st.session_state.thread_id, current_user_id):
+    if st.session_state.chat_thread:
+        st.session_state.thread_id = st.session_state.chat_thread[-1]
+    else:
+        st.session_state.thread_id = generate_thread_id(current_user_id)
+
+# Sync sidebar list with persisted checkpoints for this user on each run.
+persisted_threads = get_user_threads(current_user_id)
+for persisted_thread in persisted_threads:
+    if persisted_thread not in st.session_state.chat_thread:
+        st.session_state.chat_thread.append(persisted_thread)
+
+st.session_state.chat_thread = [
+    thread_id for thread_id in st.session_state.chat_thread if is_user_thread(thread_id, current_user_id)
+]
 
 add_to_chat_thread(st.session_state["thread_id"])
 
@@ -388,9 +646,18 @@ else:
 # Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("### Resume Chat")
+st.sidebar.caption(f"Signed in as {current_user['name']}")
+
+if st.sidebar.button("Logout", use_container_width=True):
+    st.session_state.auth_user = None
+    st.session_state.message_history = []
+    st.session_state.pending_prompt = None
+    st.session_state.pop("thread_id", None)
+    st.session_state.pop("chat_thread", None)
+    st.rerun()
 
 if st.sidebar.button("＋ New conversation", use_container_width=True):
-    reset_chat()
+    reset_chat(current_user_id)
     st.rerun()
 
 if st.sidebar.button("Clear current chat", use_container_width=True):
