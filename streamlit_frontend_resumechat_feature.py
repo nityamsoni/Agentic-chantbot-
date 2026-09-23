@@ -613,7 +613,7 @@ st.markdown(
 st.markdown(
     f"""
     <div class="app-header">
-        <h1>Resume Chat Assistant</h1>
+        <h1> Chat Assistant</h1>
         <span class="meta">{len(message_history)} messages · thread {current_thread_id[:8]}</span>
     </div>
     """,
