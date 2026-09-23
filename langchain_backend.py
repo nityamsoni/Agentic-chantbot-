@@ -6,8 +6,11 @@ from typing import TypedDict, Annotated, Dict, Any, Optional
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.graph.message import add_messages
-# from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+except ModuleNotFoundError:
+    SqliteSaver = None
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
@@ -204,9 +207,13 @@ def chat_message(state:WorkflowState) -> WorkflowState:
        return {'messages': [response]}
        
 
-conn= sqlite3.connect("chatbot.db" , check_same_thread=False)
-
-checkpointer=SqliteSaver(conn=conn)
+if SqliteSaver is not None:
+    conn = sqlite3.connect("chatbot.db", check_same_thread=False)
+    checkpointer = SqliteSaver(conn=conn)
+else:
+    # Fallback keeps app booting on platforms where sqlite checkpoint extras are missing.
+    conn = None
+    checkpointer = MemorySaver()
 stategraph=StateGraph(WorkflowState)
 
 stategraph.add_node("chat_node",chat_node)
