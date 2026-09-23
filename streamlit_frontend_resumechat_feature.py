@@ -243,19 +243,6 @@ st.markdown(
         margin: 0.9rem 0;
     }
 
-    .sidebar-threads {
-        max-height: 52vh;
-        overflow-y: auto;
-        padding-right: 2px;
-    }
-    .sidebar-threads::-webkit-scrollbar {
-        width: 6px;
-    }
-    .sidebar-threads::-webkit-scrollbar-thumb {
-        background: var(--sidebar-border);
-        border-radius: 3px;
-    }
-
     /* Buttons */
     .stButton > button, .stDownloadButton > button {
         border-radius: 8px;
@@ -328,6 +315,15 @@ st.markdown(
         background: var(--surface);
         border-radius: 8px;
         border: 1px dashed var(--border);
+    }
+
+    div[data-testid="stBottomBlockContainer"] {
+        max-width: 860px;
+        margin: 0 auto;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        background: transparent;
+        border-top: 1px solid var(--border);
     }
 
     /* Status / expander boxes */
@@ -404,21 +400,18 @@ if st.sidebar.button("Clear current chat", use_container_width=True):
 st.sidebar.divider()
 st.sidebar.markdown("### History")
 
-with st.sidebar.container():
-    st.markdown('<div class="sidebar-threads">', unsafe_allow_html=True)
-    for thread_id in st.session_state["chat_thread"][::-1]:
-        title = get_thread_title(thread_id)
-        is_active = thread_id == current_thread_id
-        if st.button(
-            title,
-            key=f"thread_{thread_id}",
-            use_container_width=True,
-            type="primary" if is_active else "secondary",
-        ):
-            if not is_active:
-                select_thread(thread_id)
-                st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+for thread_id in st.session_state["chat_thread"][::-1]:
+    title = get_thread_title(thread_id)
+    is_active = thread_id == current_thread_id
+    if st.sidebar.button(
+        title,
+        key=f"thread_{thread_id}",
+        use_container_width=True,
+        type="primary" if is_active else "secondary",
+    ):
+        if not is_active:
+            select_thread(thread_id)
+            st.rerun()
 
 # ---------------------------------------------------------------------------
 # Chat history / empty state
