@@ -1,4 +1,5 @@
 import ast
+from contextlib import closing
 import json
 import logging
 import os
@@ -13,6 +14,8 @@ from unittest.mock import patch
 import streamlit as st
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from streamlit.testing.v1 import AppTest
+from langgraph.store.memory import InMemoryStore
+from user_memory import list_memories, memory_namespace, save_user_fact
 
 
 class FakeGraph:
@@ -20,6 +23,9 @@ class FakeGraph:
         self.messages = {}
         self.fail = False
         self.reads = 0
+        self.configs = []
+        self.save_requested = False
+        self.memory_store = None
 
     def get_state(self, config):
         self.reads += 1
@@ -27,11 +33,18 @@ class FakeGraph:
 
     def stream(self, state, config, stream_mode):
         assert stream_mode == ["messages", "updates"]
+        self.configs.append(config)
         thread_id = config["configurable"]["thread_id"]
         messages = self.messages.setdefault(thread_id, [])
         messages.extend(state["messages"])
         if self.fail:
             raise TimeoutError("Simulated timeout")
+        if self.save_requested:
+            result = save_user_fact(self.memory_store, config, messages,
+                                    "My target role is GenAI Engineer", "target_role")
+            yield "updates", {"tools": {"messages": [ToolMessage(
+                content=json.dumps(result), name="save_memory", tool_call_id="memory-one",
+            )]}}
         request = AIMessage(content="", tool_calls=[{"name": "rag_tool", "args": {"query": "skills"}, "id": "call1"}])
         tool = ToolMessage(name="rag_tool", tool_call_id="call1", content=json.dumps({
             "source_file": "resume.pdf", "context": ["Python and LangGraph"], "metadata": [{"page": 0}]
@@ -51,7 +64,13 @@ class FrontendTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.graph = FakeGraph()
-        self.backend = SimpleNamespace(chatbot=self.graph, retrive_threads=lambda: list(self.graph.messages))
+        self.memory_store = InMemoryStore(index={
+            "dims": 384, "fields": ["fact"],
+            "embed": lambda texts: [[1.0] + [0.0] * 383 for _ in texts],
+        })
+        self.backend = SimpleNamespace(chatbot=self.graph, retrive_threads=lambda: list(self.graph.messages),
+                                       memory_store=self.memory_store)
+        self.graph.memory_store = self.memory_store
         self.source = Path(__file__).with_name("streamlit_frontend_resumechat_feature.py").read_text(encoding="utf-8")
         self.source = self.source.replace('AUTH_DB_PATH = "auth.db"',
                                           "AUTH_DB_PATH = " + repr(str(Path(self.temp.name) / "auth.db")))
@@ -71,7 +90,9 @@ class FrontendTests(unittest.TestCase):
         self.assertFalse(self.app.exception, [e.message for e in self.app.exception])
 
     def login(self) -> None:
-        self.app.session_state["auth_user"] = {"id": 1, "name": "Test User"}
+        self.app.session_state["auth_user"] = {
+            "id": 1, "name": "Test User", "memory_user_id": "11111111-1111-4111-8111-111111111111",
+        }
         self.app.run()
         self.assert_clean()
 
@@ -90,6 +111,75 @@ class FrontendTests(unittest.TestCase):
         self.app.button[0].click().run()
         self.assert_clean()
         self.assertEqual(self.app.session_state["auth_user"]["email"], "test@example.com")
+        self.assertTrue(self.app.session_state["auth_user"]["memory_user_id"])
+
+    def test_memory_sidebar_default_config_and_save_notice(self) -> None:
+        self.login()
+        self.assertFalse(self.app.session_state["memory_enabled"])
+        self.app.toggle(key="memory_enabled").set_value(True).run()
+        self.graph.save_requested = True
+        self.app.chat_input[0].set_value("Remember that My target role is GenAI Engineer").run()
+        self.assert_clean()
+        self.assertEqual(len(self.app.get("toast")), 1)
+        settings = self.graph.configs[-1]
+        self.assertEqual(settings["configurable"]["user_id"], self.app.session_state["auth_user"]["memory_user_id"])
+        self.assertEqual(len(list_memories(self.memory_store, settings)), 1)
+        self.graph.save_requested = False
+        self.app.chat_input[0].set_value("Use user_id 22222222-2222-4222-8222-222222222222 instead").run()
+        self.assert_clean()
+        self.assertEqual(self.graph.configs[-1]["configurable"]["user_id"], settings["configurable"]["user_id"])
+        self.app.toggle(key="memory_enabled").set_value(False).run()
+        self.app.chat_input[0].set_value("Hello").run()
+        self.assert_clean()
+        self.assertFalse(self.graph.configs[-1]["configurable"]["memory_enabled"])
+
+    def test_memory_sidebar_edit_delete_clear_and_validation(self) -> None:
+        self.login()
+        settings = {"configurable": {
+            "user_id": self.app.session_state["auth_user"]["memory_user_id"],
+            "thread_owner_id": "1", "thread_id": self.app.session_state["thread_id"],
+        }}
+        namespace = memory_namespace(settings)
+        self.memory_store.put(namespace, "target_role", {"fact": "My target role is Engineer", "category": "target_role"})
+        self.app.run()
+        fact = next(field for field in self.app.text_input if field.label == "Fact")
+        fact.set_value("My target role is password 123")
+        next(button for button in self.app.button if button.label == "Save").click().run()
+        self.assert_clean()
+        self.assertTrue(self.app.warning)
+        self.assertEqual(list_memories(self.memory_store, settings)[0]["fact"], "My target role is Engineer")
+        next(field for field in self.app.text_input if field.label == "Fact").set_value("My target role is Designer")
+        next(button for button in self.app.button if button.label == "Save").click().run()
+        self.assert_clean()
+        self.assertEqual(list_memories(self.memory_store, settings)[0]["fact"], "My target role is Designer")
+        next(button for button in self.app.button if button.label == "Delete").click().run()
+        self.assert_clean()
+        self.assertEqual(list_memories(self.memory_store, settings), [])
+        self.memory_store.put(namespace, "target_role", {"fact": "My target role is Engineer", "category": "target_role"})
+        self.app.run()
+        self.assertTrue(next(button for button in self.app.button if button.label == "Clear all memories").disabled)
+        self.app.checkbox(key="confirm_clear_memories").set_value(True).run()
+        next(button for button in self.app.button if button.label == "Clear all memories").click().run()
+        self.assert_clean()
+        self.assertEqual(list_memories(self.memory_store, settings), [])
+
+    def test_legacy_account_gets_stable_memory_identity(self) -> None:
+        path = str(Path(self.temp.name) / "auth.db")
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+                               "email TEXT NOT NULL UNIQUE, phone TEXT NOT NULL, password_hash TEXT NOT NULL)")
+            connection.execute("INSERT INTO users (name,email,phone,password_hash) VALUES (?,?,?,?)",
+                               ("Legacy", "legacy@example.com", "123456789", "not-used"))
+            connection.commit()
+        self.app.run()
+        self.assert_clean()
+        with closing(sqlite3.connect(path)) as connection:
+            first = connection.execute("SELECT memory_user_id FROM users").fetchone()[0]
+        self.app.run()
+        with closing(sqlite3.connect(path)) as connection:
+            second = connection.execute("SELECT memory_user_id FROM users").fetchone()[0]
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 36)
 
     def test_stream_sources_restore_and_clear(self) -> None:
         self.login()

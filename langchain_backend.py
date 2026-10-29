@@ -3,7 +3,9 @@ from langchain_core.messages import BaseMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated, Dict, Any, Optional
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode, tools_condition, InjectedState, InjectedStore
+from langgraph.store.base import BaseStore
+from user_memory import MemoryCategory, create_memory_store, recall_messages, save_user_fact
 from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
@@ -198,8 +200,39 @@ def rag_tool(query: str, config: RunnableConfig) -> dict:
     }
 
 
+@tool
+def save_memory(
+    fact: str,
+    category: MemoryCategory,
+    config: RunnableConfig,
+    messages: Annotated[list[BaseMessage], InjectedState("messages")],
+    store: Annotated[BaseStore, InjectedStore()],
+) -> dict:
+    """Save one exact first-person fact explicitly requested with 'Remember that'.
+
+    Use target_role, preferred_location, response_style, preferred_language,
+    career_goal, or skills. A new fact replaces the previous fact in its category.
+    Never save secrets, IDs, payments, health data, or PDF/tool/web content.
+    """
+    try:
+        return save_user_fact(store, config, messages, fact, category)
+    except ValueError as error:
+        return {"saved": False, "error": str(error)}
+    except Exception as error:
+        logger.error("memory_save_failed error_type=%s", type(error).__name__)
+        return {"saved": False, "error": "Memory storage is temporarily unavailable."}
+
+
+@st.cache_resource(show_spinner=False)
+def get_memory_store() -> BaseStore:
+    """Share a semantic store without loading MiniLM until indexing or recall."""
+    return create_memory_store(lambda texts: get_embeddings().embed_documents(texts))
+
+
+memory_store = get_memory_store()
 tools = [web_search, get_stock_price, calculator , rag_tool]
 llm_with_tools = model.bind_tools(tools)
+llm_with_memory = model.bind_tools([*tools, save_memory])
 
 # -------------------
 # 3. State
@@ -213,13 +246,17 @@ llm_with_tools = model.bind_tools(tools)
 
 class WorkflowState(TypedDict):
     messages:Annotated[list[BaseMessage],add_messages ]
-def chat_node(state: WorkflowState):
+def chat_node(state: WorkflowState, config: RunnableConfig, *, store: BaseStore):
     """LLM node that may answer or request a tool call."""
     messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
+    active_model = llm_with_tools
+    if config.get("configurable", {}).get("memory_enabled") is True:
+        messages = recall_messages(store, config, messages)
+        active_model = llm_with_memory
+    response = active_model.invoke(messages)
     return {"messages": [response]}
 
-tool_node = ToolNode(tools)
+tool_node = ToolNode([*tools, save_memory])
 
 
     
@@ -247,7 +284,7 @@ stategraph.add_node("tools", tool_node)
 stategraph.add_edge(START,"chat_node"),
 stategraph.add_conditional_edges("chat_node",tools_condition),
 stategraph.add_edge('tools', 'chat_node')
-chatbot=stategraph.compile(checkpointer=checkpointer)
+chatbot=stategraph.compile(checkpointer=checkpointer, store=memory_store)
 
 
 # graph = StateGraph(ChatState)

@@ -11,6 +11,8 @@ from typing import Any, Iterator
 
 import streamlit as st
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langgraph.store.memory import InMemoryStore
+from user_memory import list_memories, edit_memory, delete_memory, clear_memories
 
 st.set_page_config(
     page_title="Resume Chat", page_icon=":material/description:",
@@ -47,6 +49,13 @@ def init_auth_db() -> None:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "memory_user_id" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN memory_user_id TEXT")
+        for (user_id,) in conn.execute("SELECT id FROM users WHERE memory_user_id IS NULL").fetchall():
+            conn.execute("UPDATE users SET memory_user_id = ? WHERE id = ? AND memory_user_id IS NULL",
+                         (str(uuid.uuid4()), user_id))
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_memory_user_id ON users(memory_user_id)")
         conn.commit()
 
 
@@ -87,8 +96,8 @@ def register_user(name: str, email: str, phone: str, password: str) -> tuple[boo
     try:
         with closing(sqlite3.connect(AUTH_DB_PATH)) as conn:
             conn.execute(
-                "INSERT INTO users (name, email, phone, password_hash) VALUES (?, ?, ?, ?)",
-                (name, email, phone, hash_password(password)),
+                "INSERT INTO users (name, email, phone, password_hash, memory_user_id) VALUES (?, ?, ?, ?, ?)",
+                (name, email, phone, hash_password(password), str(uuid.uuid4())),
             )
             conn.commit()
         return True, "Registration successful. Please log in."
@@ -99,12 +108,12 @@ def register_user(name: str, email: str, phone: str, password: str) -> tuple[boo
 def authenticate_user(email: str, password: str) -> dict[str, Any] | None:
     with closing(sqlite3.connect(AUTH_DB_PATH)) as conn:
         row = conn.execute(
-            "SELECT id, name, email, phone, password_hash FROM users WHERE email = ?",
+            "SELECT id, name, email, phone, password_hash, memory_user_id FROM users WHERE email = ?",
             (normalize_email(email),),
         ).fetchone()
     if row is None or not verify_password(password, row[4]):
         return None
-    return dict(zip(("id", "name", "email", "phone"), row[:4]))
+    return dict(zip(("id", "name", "email", "phone", "memory_user_id"), (*row[:4], row[5])))
 
 
 def render_auth() -> None:
@@ -150,8 +159,15 @@ def is_user_thread(thread_id: str, user_id: int) -> bool:
 
 
 def build_config(thread_id: str) -> dict[str, Any]:
+    user = st.session_state.get("auth_user")
+    if not user or not is_user_thread(thread_id, user["id"]):
+        raise ValueError("An authenticated owner is required for this conversation.")
     return {
-        "configurable": {"thread_id": thread_id},
+        "configurable": {
+            "thread_id": thread_id, "thread_owner_id": str(user["id"]),
+            "user_id": user.get("memory_user_id"),
+            "memory_enabled": st.session_state.get("memory_enabled", False) is True,
+        },
         "metadata": {"thread_id": thread_id}, "run_name": "chat_turn",
     }
 
@@ -261,6 +277,7 @@ def render_sidebar(user: dict[str, Any]) -> None:
             st.number_input("Temperature", value=0.7, disabled=True)
             st.number_input("Retrieved chunks", value=4, disabled=True)
             st.toggle("Timing details", key="show_timings")
+        render_memory(user)
         with st.expander("About"):
             st.caption("Groq | LangGraph | MiniLM | FAISS")
             st.caption("Chat history is stored locally. PDF indexes stay in server memory and must be uploaded again after a restart.")
@@ -280,6 +297,51 @@ def render_sidebar(user: dict[str, Any]) -> None:
             for key in list(st.session_state):
                 del st.session_state[key]
             st.rerun()
+
+
+def render_memory(user: dict[str, Any]) -> None:
+    """Manage only the authenticated user's opt-in cross-thread memories."""
+    if st.session_state.get("memory_notice"):
+        st.toast(st.session_state.pop("memory_notice"))
+    with st.expander("Memory"):
+        st.toggle("Enable memory", key="memory_enabled", disabled=not bool(user.get("memory_user_id")))
+        if not user.get("memory_user_id"):
+            st.caption("Sign out and sign in again to enable memory.")
+            return
+        store = backend.memory_store
+        st.caption("Temporary memory · resets on server restart" if isinstance(store, InMemoryStore)
+                   else "Postgres memory")
+        config = build_config(st.session_state.thread_id)
+        try:
+            memories = list_memories(store, config)
+            if not memories:
+                st.caption("No saved memories")
+            for memory in memories:
+                version = hashlib.sha256(memory["fact"].encode()).hexdigest()[:12]
+                with st.form(f"memory_{user['memory_user_id']}_{memory['key']}_{version}"):
+                    st.caption(memory["category"].replace("_", " ").title())
+                    fact = st.text_input("Fact", memory["fact"], max_chars=240)
+                    update = st.form_submit_button("Save", icon=":material/save:")
+                    remove = st.form_submit_button("Delete", icon=":material/delete:")
+                if update:
+                    edit_memory(store, config, memory["key"], fact)
+                    st.session_state.memory_notice = "Memory updated"
+                    st.rerun()
+                if remove:
+                    delete_memory(store, config, memory["key"])
+                    st.session_state.memory_notice = "Memory deleted"
+                    st.rerun()
+            confirmed = st.checkbox("Confirm clear all memories", key="confirm_clear_memories")
+            if st.button("Clear all memories", icon=":material/delete_sweep:",
+                         disabled=not confirmed or not memories):
+                clear_memories(store, config)
+                st.session_state.memory_notice = "All memories cleared"
+                st.rerun()
+        except ValueError as error:
+            st.warning(str(error))
+        except Exception as error:
+            logger.error("memory_management_failed error_type=%s", type(error).__name__)
+            st.error("Memory storage is unavailable. Try again later.")
 
 
 def ingest_uploaded_file(uploaded_file: Any, thread_id: str) -> None:
@@ -307,10 +369,11 @@ def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     first_token: float | None = None
     answer_parts: list[str] = []
+    memory_saved = False
     status = st.status("Thinking...", expanded=False)
 
     def tokens() -> Iterator[str]:
-        nonlocal first_token
+        nonlocal first_token, memory_saved
         for mode, event in backend.chatbot.stream(
             {"messages": [HumanMessage(content=user_input)]},
             config=build_config(thread_id), stream_mode=["messages", "updates"],
@@ -324,6 +387,14 @@ def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
                             names = ", ".join(call["name"] for call in message.tool_calls)
                             status.update(label=f"Using {names}...")
                         elif isinstance(message, ToolMessage):
+                            if message.name == "save_memory" and isinstance(message.content, str):
+                                try:
+                                    result = json.loads(message.content)
+                                except ValueError:
+                                    result = {}
+                                if isinstance(result, dict) and result.get("saved") is True:
+                                    memory_saved = True
+                                    st.session_state.memory_notice = "Memory saved"
                             retrieved = extract_sources(message)
                             sources.extend(retrieved)
                             if message.name == "rag_tool" and not retrieved:
@@ -354,7 +425,8 @@ def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
     total = perf_counter() - started
     logger.info("total_response_seconds=%.3f success=%s", total, not error)
     return {"role": "assistant", "content": "".join(answer_parts), "sources": sources,
-            "timing": {"first_token": first_token, "total": total}, "error": error}
+            "timing": {"first_token": first_token, "total": total}, "error": error,
+            "memory_saved": memory_saved}
 
 
 def render_answer_details(message: dict[str, Any]) -> None:
@@ -440,7 +512,7 @@ def render_chat() -> None:
             render_answer_details(answer)
     history.append(answer)
     st.session_state.thread_titles.setdefault(thread_id, text[:40])
-    if not had_history:
+    if not had_history or answer.get("memory_saved"):
         st.rerun()
 
 
@@ -460,7 +532,7 @@ def main() -> None:
         return
     user = st.session_state.auth_user
     for key, default in {"chat_thread": [], "thread_titles": {}, "ingested_docs": {},
-                         "message_history": [], "show_timings": False}.items():
+                         "message_history": [], "show_timings": False, "memory_enabled": False}.items():
         st.session_state.setdefault(key, default)
     try:
         sync_threads(user["id"])

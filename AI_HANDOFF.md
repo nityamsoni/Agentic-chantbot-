@@ -2,6 +2,51 @@
 
 Updated: 2026-10-29.
 
+## Latest Update: Opt-In User Memory
+
+The user explicitly requested cross-thread long-term memory after the composer
+fix. This authorizes recall prompt/tool additions ONLY while memory is enabled;
+default-off behavior and the model, temperature, RAG, chunking, and existing
+tools remain unchanged. The earlier historical notes below predate this feature.
+
+- New `user_memory.py` contains the policy, store factory, namespaces, CRUD,
+  and recall. Backend graph compilation now passes both checkpointer and store.
+- `DATABASE_URL` selects Postgres with setup migrations; otherwise an indexed
+  in-process store is used and logged. MiniLM and 384 dimensions are reused.
+  Postgres startup failure is explicit, sanitized, and does not fall back to RAM.
+- New requirements: `langgraph-checkpoint-postgres>=3.0.0` and
+  `psycopg[binary,pool]>=3.2.0` (including binary and pool distributions).
+- Accounts gain a backfilled stable `memory_user_id` UUID. This authenticated
+  value forms namespace `("memories", user_id)`; thread ownership still uses
+  the existing numeric ID prefix. Identity is not in the model tool schema.
+- Sidebar Memory is off by default, with list/edit/delete/confirmed clear all,
+  persistence notice, and saved-memory toast. Sign out/in after an old session
+  to receive the new authenticated memory identity.
+- Save tool requires an explicit latest-human `Remember that <exact fact>`.
+  Only six single-value categories are supported: target_role,
+  preferred_location, response_style, preferred_language, career_goal, skills.
+  Upserts use the category as a stable key; repeated values are no-ops.
+- The bounded first-person schema and conservative privacy filters reject
+  sensitive markers, numbers, tokens, health/payment terms, source markers,
+  and instruction-like content before embedding/writing. They can reject safe
+  facts too and are not an unrestricted multilingual sensitive-data detector.
+- Recall searches the latest human message for up to four same-user matches,
+  injects a transient Known about the user system message, and logs
+  `memory_recall_seconds`. No raw facts or queries are logged by this feature.
+- Deleting memories does not scrub chat checkpoints, old answers, or backups.
+  Verify forgetting in a fresh thread; the original transcript still exists.
+- Test suite now has 22 passing tests: 11 frontend and 11 memory tests, with
+  fake embeddings/models plus actual LangGraph store/tool injection. Postgres
+  factory/setup behavior is mocked, not a real database connectivity test.
+- New `test_memory.py`; existing `test_frontend.py` extended. Run
+  `myenv\Scripts\python.exe -m unittest test_frontend test_memory -v`.
+- README has full storage setup, privacy limitations, and two-thread manual
+  verification steps. Live Groq recall, real MiniLM indexing, and real Postgres
+  require manual/environment validation. No paid service was provisioned.
+
+The older SQLite corruption issue remains separate: Postgres memory does not
+replace, reset, repair, or migrate the chat checkpoint database.
+
 This document summarizes the preceding coding conversation and current local
 implementation. Give it to another AI along with the relevant source files.
 It is a context handoff, not an automatically loaded agent skill. Source code
@@ -17,7 +62,8 @@ database on Streamlit Cloud, not a model or retrieval error.
 
 The backend now supports an explicit alternative database path. This provides
 a fresh-start option; it does not repair or migrate the corrupt database.
-All eight local regression tests passed after the composer layout follow-up.
+All eight earlier regression tests passed after the composer layout follow-up;
+the memory update above expands the passing suite to 22 tests.
 Cloud repair, deployment of the latest local changes, and acceptance of empty
 history have NOT been verified.
 
