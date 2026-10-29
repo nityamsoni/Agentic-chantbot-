@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Resume Chat",
+			"type": "shell",
+			"command": "d:\\LangGarph-tutorials\\myenv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"streamlit",
+				"run",
+				"streamlit_frontend_resumechat_feature.py",
+				"--server.address=127.0.0.1",
+				"--server.port=8502",
+				"--server.headless=true",
+				"--browser.gatherUsageStats=false"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

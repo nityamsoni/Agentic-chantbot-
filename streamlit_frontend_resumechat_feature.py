@@ -1,49 +1,53 @@
-import streamlit as st
-from langchain_backend import chatbot, retrive_threads, ingest_pdf
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-import uuid
-import sqlite3
 import hashlib
 import hmac
+import json
+import logging
 import os
+import sqlite3
+import uuid
+from contextlib import closing
+from time import perf_counter
+from typing import Any, Iterator
 
+import streamlit as st
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 st.set_page_config(
-    page_title="Resume Chat Assistant",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title="Resume Chat", page_icon=":material/description:",
+    layout="wide", initial_sidebar_state="expanded",
 )
 
-USER_AVATAR = "🧑"
-ASSISTANT_AVATAR = "📄"
-
+AUTH_DB_PATH = "auth.db"
+HISTORY_REFRESH_SECONDS = 30
 SUGGESTED_PROMPTS = [
     "Review my resume for a GenAI Engineer role",
     "Summarize the skills section",
     "What's missing from this resume?",
     "Rewrite my project bullets to be more impactful",
 ]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-AUTH_DB_PATH = "auth.db"
+
+@st.cache_resource(show_spinner=False)
+def load_backend() -> Any:
+    """Import the shared graph once, after authentication."""
+    import langchain_backend
+    return langchain_backend
 
 
-def init_auth_db():
-    conn = sqlite3.connect(AUTH_DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            phone TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+def init_auth_db() -> None:
+    """Create the existing local account table if needed."""
+    with closing(sqlite3.connect(AUTH_DB_PATH)) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+                phone TEXT NOT NULL, password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
 
 
 def normalize_email(email: str) -> str:
@@ -57,26 +61,21 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify salted hashes and supported legacy SHA-256 hashes."""
     try:
-        algo, iterations_str, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if "$" not in stored_hash:
+            return hmac.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored_hash)
+        algo, iterations, salt, digest = stored_hash.split("$", 3)
         if algo != "pbkdf2_sha256":
-            # Backward compatibility for old unsalted SHA-256 hashes.
-            return hmac.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
-
-        iterations = int(iterations_str)
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-        return hmac.compare_digest(actual, expected)
-    except Exception:
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(iterations))
+        return hmac.compare_digest(actual, bytes.fromhex(digest))
+    except (ValueError, TypeError):
         return False
 
 
 def register_user(name: str, email: str, phone: str, password: str) -> tuple[bool, str]:
-    name = name.strip()
-    email = normalize_email(email)
-    phone = phone.strip()
-
+    name, email, phone = name.strip(), normalize_email(email), phone.strip()
     if not name:
         return False, "Name is required."
     if "@" not in email or "." not in email:
@@ -85,50 +84,64 @@ def register_user(name: str, email: str, phone: str, password: str) -> tuple[boo
         return False, "Enter a valid phone number."
     if len(password) < 6:
         return False, "Password must be at least 6 characters."
-
     try:
-        conn = sqlite3.connect(AUTH_DB_PATH)
-        conn.execute(
-            "INSERT INTO users (name, email, phone, password_hash) VALUES (?, ?, ?, ?)",
-            (name, email, phone, hash_password(password)),
-        )
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(AUTH_DB_PATH)) as conn:
+            conn.execute(
+                "INSERT INTO users (name, email, phone, password_hash) VALUES (?, ?, ?, ?)",
+                (name, email, phone, hash_password(password)),
+            )
+            conn.commit()
         return True, "Registration successful. Please log in."
     except sqlite3.IntegrityError:
         return False, "Email already registered."
 
 
-def authenticate_user(email: str, password: str):
-    email = normalize_email(email)
-    conn = sqlite3.connect(AUTH_DB_PATH)
-    cursor = conn.execute(
-        "SELECT id, name, email, phone, password_hash FROM users WHERE email = ?",
-        (email,),
-    )
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
+def authenticate_user(email: str, password: str) -> dict[str, Any] | None:
+    with closing(sqlite3.connect(AUTH_DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT id, name, email, phone, password_hash FROM users WHERE email = ?",
+            (normalize_email(email),),
+        ).fetchone()
+    if row is None or not verify_password(password, row[4]):
         return None
+    return dict(zip(("id", "name", "email", "phone"), row[:4]))
 
-    user_id, name, user_email, phone, password_hash = row
-    if not verify_password(password, password_hash):
-        return None
 
-    return {
-        "id": user_id,
-        "name": name,
-        "email": user_email,
-        "phone": phone,
-    }
+def render_auth() -> None:
+    """Render account forms without importing embedding or model resources."""
+    with st.container(horizontal_alignment="center"):
+        with st.container(width=480):
+            st.title("Resume Chat")
+            st.caption("Your resume. Your next opportunity.")
+            mode = st.segmented_control("Account", ["Login", "Register"], default="Login")
+            if mode == "Register":
+                with st.form("register_form"):
+                    name = st.text_input("Name")
+                    email = st.text_input("Email")
+                    phone = st.text_input("Phone number")
+                    password = st.text_input("Password", type="password")
+                    submitted = st.form_submit_button("Create account", use_container_width=True)
+                if submitted:
+                    ok, message = register_user(name, email, phone, password)
+                    (st.success if ok else st.error)(message)
+            else:
+                with st.form("login_form"):
+                    email = st.text_input("Email")
+                    password = st.text_input("Password", type="password")
+                    submitted = st.form_submit_button("Sign in", use_container_width=True)
+                if submitted:
+                    user = authenticate_user(email, password)
+                    if user:
+                        st.session_state.auth_user = user
+                        st.rerun()
+                    st.error("Invalid email or password.")
 
 
 def user_thread_prefix(user_id: int) -> str:
     return f"u{user_id}:"
 
 
-def generate_thread_id(user_id: int):
+def generate_thread_id(user_id: int) -> str:
     return f"{user_thread_prefix(user_id)}{uuid.uuid4()}"
 
 
@@ -136,640 +149,311 @@ def is_user_thread(thread_id: str, user_id: int) -> bool:
     return str(thread_id).startswith(user_thread_prefix(user_id))
 
 
-def get_user_threads(user_id: int):
-    all_threads = retrive_threads()
-    return [thread_id for thread_id in all_threads if is_user_thread(thread_id, user_id)]
-
-
-def build_config(thread_id):
+def build_config(thread_id: str) -> dict[str, Any]:
     return {
         "configurable": {"thread_id": thread_id},
-        "metadata": {"thread_id": thread_id},
-        "run_name": "chat_turn",
+        "metadata": {"thread_id": thread_id}, "run_name": "chat_turn",
     }
 
 
-def add_to_chat_thread(thread_id):
-    if thread_id not in st.session_state.chat_thread:
-        st.session_state.chat_thread.append(thread_id)
+def load_converstaion(thread_id: str) -> list[BaseMessage]:
+    return backend.chatbot.get_state(build_config(thread_id)).values.get("messages", [])
 
 
-def load_converstaion(thread_id):
-    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
-    return state.values.get("messages", [])
+def extract_sources(message: ToolMessage) -> list[dict[str, Any]]:
+    """Read source previews from the existing RAG tool output."""
+    if message.name != "rag_tool" or not isinstance(message.content, str):
+        return []
+    try:
+        payload = json.loads(message.content)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    sources = []
+    metadata = payload.get("metadata", [])
+    for index, text in enumerate(payload.get("context", [])):
+        meta = metadata[index] if index < len(metadata) else {}
+        page = meta.get("page_label")
+        if page is None and isinstance(meta.get("page"), int):
+            page = meta["page"] + 1
+        sources.append({"filename": payload.get("source_file") or "Uploaded PDF",
+                        "page": page, "snippet": str(text)[:700]})
+    return sources
 
 
-def format_messages(messages):
-    formatted_messages = []
+def format_messages(messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    """Restore visible answers and their retrieved source previews."""
+    formatted = []
+    sources: list[dict[str, Any]] = []
     for message in messages:
         if isinstance(message, HumanMessage):
-            formatted_messages.append({"role": "user", "content": message.content})
-        elif isinstance(message, AIMessage):
-            formatted_messages.append({"role": "assistant", "content": message.content})
-    return formatted_messages
+            sources = []
+            formatted.append({"role": "user", "content": message.content})
+        elif isinstance(message, ToolMessage):
+            sources.extend(extract_sources(message))
+        elif isinstance(message, AIMessage) and message.content:
+            formatted.append({"role": "assistant", "content": message.content,
+                              "sources": list(sources)})
+    return formatted
 
 
-def get_thread_title(thread_id):
+def get_thread_title(thread_id: str) -> str:
+    titles = st.session_state.setdefault("thread_titles", {})
+    if thread_id in titles:
+        return titles[thread_id]
     for message in load_converstaion(thread_id):
         if isinstance(message, HumanMessage) and isinstance(message.content, str):
             content = message.content.strip()
             if content:
-                return content[:40]
+                titles[thread_id] = content[:40]
+                return titles[thread_id]
     return "New conversation"
 
 
-def reset_chat(user_id: int):
+def reset_chat(user_id: int) -> None:
+    """Start an empty graph thread without deleting saved conversations."""
     thread_id = generate_thread_id(user_id)
     st.session_state.thread_id = thread_id
-    add_to_chat_thread(thread_id)
+    st.session_state.chat_thread.append(thread_id)
     st.session_state.message_history = []
 
 
-def select_thread(thread_id):
+def select_thread(thread_id: str) -> None:
     st.session_state.thread_id = thread_id
     st.session_state.message_history = format_messages(load_converstaion(thread_id))
 
 
-def ingest_uploaded_file(uploaded_file, thread_id, thread_docs):
-    if uploaded_file is None:
-        return None
-
-    if uploaded_file.name in thread_docs:
-        return thread_docs[uploaded_file.name]
-
-    with st.status(f"Reading {uploaded_file.name}", expanded=True) as status_box:
-        summary = ingest_pdf(
-            uploaded_file.getvalue(),
-            thread_id=thread_id,
-            filename=uploaded_file.name,
-        )
-        thread_docs[uploaded_file.name] = summary
-        status_box.update(label=f"Indexed {uploaded_file.name}", state="complete", expanded=False)
-        return summary
+def sync_threads(user_id: int, force: bool = False) -> None:
+    """Throttle checkpoint enumeration within this user's session."""
+    now = perf_counter()
+    if not force and now - st.session_state.get("threads_refreshed", -float("inf")) < HISTORY_REFRESH_SECONDS:
+        return
+    for thread_id in sorted(backend.retrive_threads()):
+        if is_user_thread(thread_id, user_id) and thread_id not in st.session_state.chat_thread:
+            st.session_state.chat_thread.append(thread_id)
+    st.session_state.threads_refreshed = now
 
 
-if "message_history" not in st.session_state:
-    st.session_state.message_history = []
+def render_sources(sources: list[dict[str, Any]]) -> None:
+    if not sources:
+        return
+    with st.expander(f"Retrieved sources ({len(sources)})"):
+        for source in sources:
+            page = f" | Page {source['page']}" if source.get("page") is not None else ""
+            st.text(f"{source['filename']}{page}")
+            st.caption(source["snippet"])
 
-if "ingested_docs" not in st.session_state:
-    st.session_state["ingested_docs"] = {}
 
-if "pending_prompt" not in st.session_state:
-    st.session_state.pending_prompt = None
-
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
-
-if "auth_mode" not in st.session_state:
-    st.session_state.auth_mode = "login"
-
-init_auth_db()
-
-if st.session_state.auth_user is None:
-    st.markdown(
-        """
-        <style>
-        .auth-title {
-            font-size: clamp(1.8rem, 2.8vw, 2.4rem);
-            font-weight: 700;
-            letter-spacing: -0.02em;
-            margin: 0;
-            color: #141417;
-            text-align: center;
-        }
-        .auth-subtitle {
-            text-align: center;
-            color: #6b7280;
-            margin: 0.4rem 0 1.5rem 0;
-            font-size: 0.98rem;
-        }
-        .auth-surface {
-            background: #ffffff;
-            border: 1px solid #e5e7eb;
-            border-radius: 14px;
-            padding: 1rem;
-            box-shadow: 0 8px 30px rgba(16, 24, 40, 0.06);
-            margin-bottom: 1rem;
-        }
-        .auth-note {
-            text-align: center;
-            color: #6b7280;
-            font-size: 0.9rem;
-            margin-top: 0.55rem;
-        }
-        [data-testid="stForm"] {
-            background: #ffffff;
-            border: 1px solid #e5e7eb;
-            border-radius: 14px;
-            padding: 1rem 1rem 0.25rem 1rem;
-            box-shadow: 0 8px 28px rgba(16, 24, 40, 0.05);
-        }
-        [data-testid="stTextInput"] input {
-            border-radius: 10px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    outer_l, center, outer_r = st.columns([1, 1.2, 1])
-    with center:
-        st.markdown('<h1 class="auth-title">Resume Chat Assistant</h1>', unsafe_allow_html=True)
-        st.markdown(
-            '<p class="auth-subtitle">Sign in to access your private conversations and uploaded resume history.</p>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown('<div class="auth-surface">', unsafe_allow_html=True)
-        page_cols = st.columns(2)
-        with page_cols[0]:
-            if st.button(
-                "Login",
-                use_container_width=True,
-                type="primary" if st.session_state.auth_mode == "login" else "secondary",
-            ):
-                st.session_state.auth_mode = "login"
+def render_sidebar(user: dict[str, Any]) -> None:
+    with st.sidebar:
+        st.header("Resume Chat")
+        st.caption(user["name"])
+        if st.button("New conversation", icon=":material/add:", use_container_width=True, type="primary"):
+            reset_chat(user["id"])
+            st.rerun()
+        if st.button("Clear current chat", icon=":material/refresh:", use_container_width=True,
+                     help="Starts a fresh chat. The previous conversation stays in History."):
+            reset_chat(user["id"])
+            st.rerun()
+        with st.expander("Settings"):
+            st.text_input("Model", "openai/gpt-oss-120b", disabled=True)
+            st.number_input("Temperature", value=0.7, disabled=True)
+            st.number_input("Retrieved chunks", value=4, disabled=True)
+            st.toggle("Timing details", key="show_timings")
+        with st.expander("About"):
+            st.caption("Groq | LangGraph | MiniLM | FAISS")
+            st.caption("Chat history is stored locally. PDF indexes stay in server memory and must be uploaded again after a restart.")
+        st.divider()
+        heading, refresh = st.columns([4, 1])
+        heading.subheader("History")
+        if refresh.button("", icon=":material/sync:", help="Refresh history"):
+            sync_threads(user["id"], force=True)
+        for thread_id in reversed(st.session_state.chat_thread):
+            if st.button(get_thread_title(thread_id), key=f"thread_{thread_id}",
+                         use_container_width=True,
+                         type="primary" if thread_id == st.session_state.thread_id else "secondary"):
+                select_thread(thread_id)
                 st.rerun()
-        with page_cols[1]:
-            if st.button(
-                "Register",
-                use_container_width=True,
-                type="primary" if st.session_state.auth_mode == "register" else "secondary",
-            ):
-                st.session_state.auth_mode = "register"
-                st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        if st.session_state.auth_mode == "login":
-            st.subheader("Login")
-            with st.form("login_form", clear_on_submit=False):
-                login_email = st.text_input("Email", key="login_email", placeholder="you@example.com")
-                login_password = st.text_input("Password", type="password", key="login_password", placeholder="Enter password")
-                login_submit = st.form_submit_button("Login", use_container_width=True)
-
-            if login_submit:
-                user = authenticate_user(login_email, login_password)
-                if user is None:
-                    st.error("Invalid email or password.")
-                else:
-                    st.session_state.auth_user = user
-                    st.session_state.chat_thread = get_user_threads(user["id"])
-                    if st.session_state.chat_thread:
-                        st.session_state.thread_id = st.session_state.chat_thread[-1]
-                    else:
-                        st.session_state.thread_id = generate_thread_id(user["id"])
-                        st.session_state.chat_thread = [st.session_state.thread_id]
-                    st.session_state.message_history = []
-                    st.rerun()
-
-            st.markdown('<p class="auth-note">Don\'t have an account? Switch to Register.</p>', unsafe_allow_html=True)
-        else:
-            st.subheader("Register")
-            with st.form("register_form", clear_on_submit=True):
-                reg_name = st.text_input("Name", placeholder="Your full name")
-                reg_email = st.text_input("Email", placeholder="you@example.com")
-                reg_phone = st.text_input("Phone number", placeholder="e.g. +91 9876543210")
-                reg_password = st.text_input("Password", type="password", placeholder="At least 6 characters")
-                reg_submit = st.form_submit_button("Create account", use_container_width=True)
-
-            if reg_submit:
-                ok, msg = register_user(reg_name, reg_email, reg_phone, reg_password)
-                if ok:
-                    st.success(msg)
-                    st.session_state.auth_mode = "login"
-                else:
-                    st.error(msg)
-
-            st.markdown('<p class="auth-note">Already registered? Switch to Login.</p>', unsafe_allow_html=True)
-
-    st.stop()
-
-current_user = st.session_state.auth_user
-current_user_id = current_user["id"]
-
-if "chat_thread" not in st.session_state:
-    st.session_state.chat_thread = get_user_threads(current_user_id)
-
-if "thread_id" not in st.session_state or not is_user_thread(st.session_state.thread_id, current_user_id):
-    if st.session_state.chat_thread:
-        st.session_state.thread_id = st.session_state.chat_thread[-1]
-    else:
-        st.session_state.thread_id = generate_thread_id(current_user_id)
-
-# Sync sidebar list with persisted checkpoints for this user on each run.
-persisted_threads = get_user_threads(current_user_id)
-for persisted_thread in persisted_threads:
-    if persisted_thread not in st.session_state.chat_thread:
-        st.session_state.chat_thread.append(persisted_thread)
-
-st.session_state.chat_thread = [
-    thread_id for thread_id in st.session_state.chat_thread if is_user_thread(thread_id, current_user_id)
-]
-
-add_to_chat_thread(st.session_state["thread_id"])
-
-current_thread_id = str(st.session_state["thread_id"])
-message_history = st.session_state.message_history
-thread_docs = st.session_state["ingested_docs"].setdefault(current_thread_id, {})
-config = build_config(current_thread_id)
-latest_doc = list(thread_docs.values())[-1] if thread_docs else None
-
-# ---------------------------------------------------------------------------
-# Styling — quiet, neutral, production UI. One accent, no card-kit chrome.
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    :root {
-        --bg: #fafafa;
-        --surface: #ffffff;
-        --border: #e4e4e7;
-        --text: #18181b;
-        --text-muted: #71717a;
-        --accent: #4f46e5;
-        --accent-soft: #eef2ff;
-        --sidebar-bg: #111113;
-        --sidebar-border: #232326;
-        --sidebar-active: #1c1c1f;
-        --sidebar-text: #e4e4e7;
-        --sidebar-text-muted: #8b8b93;
-        --radius: 10px;
-    }
-
-    html, body, .stApp {
-        background: var(--bg);
-        color: var(--text);
-        font-feature-settings: "tnum";
-    }
-
-    .block-container {
-        max-width: 860px;
-        padding-top: 2.25rem;
-        padding-bottom: 7rem;
-    }
-
-    h1, h2, h3 {
-        color: var(--text);
-        letter-spacing: -0.01em;
-    }
-
-    /* Header */
-    .app-header {
-        display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        border-bottom: 1px solid var(--border);
-        padding-bottom: 0.9rem;
-        margin-bottom: 1.1rem;
-    }
-    .app-header h1 {
-        font-size: 1.35rem;
-        font-weight: 650;
-        margin: 0;
-    }
-    .app-header .meta {
-        font-size: 0.82rem;
-        color: var(--text-muted);
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-    }
-
-    /* Document status line */
-    .doc-status {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        font-size: 0.85rem;
-        color: var(--text-muted);
-        border: 1px solid var(--border);
-        background: var(--surface);
-        border-radius: var(--radius);
-        padding: 0.55rem 0.85rem;
-        margin-bottom: 1.25rem;
-    }
-    .doc-status .dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        flex-shrink: 0;
-    }
-    .doc-status.active .dot { background: var(--accent); }
-    .doc-status.idle .dot { background: #d4d4d8; }
-    .doc-status strong { color: var(--text); font-weight: 600; }
-
-    /* Empty state */
-    .empty-state {
-        text-align: center;
-        padding: 3rem 1rem 2rem;
-        color: var(--text-muted);
-    }
-    .empty-state .icon {
-        font-size: 2rem;
-        margin-bottom: 0.6rem;
-    }
-    .empty-state h3 {
-        font-size: 1.05rem;
-        color: var(--text);
-        margin-bottom: 0.25rem;
-    }
-    .empty-state p {
-        font-size: 0.88rem;
-        margin: 0;
-    }
-
-    /* Sidebar */
-    [data-testid="stSidebar"] {
-        background: var(--sidebar-bg);
-        border-right: 1px solid var(--sidebar-border);
-    }
-    [data-testid="stSidebar"] * {
-        color: var(--sidebar-text);
-    }
-    [data-testid="stSidebar"] .stCaption, [data-testid="stSidebar"] small {
-        color: var(--sidebar-text-muted) !important;
-    }
-    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
-        font-size: 0.78rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        color: var(--sidebar-text-muted);
-        margin: 0.4rem 0 0.5rem 0;
-    }
-    section[data-testid="stSidebar"] hr {
-        border-color: var(--sidebar-border);
-        margin: 0.9rem 0;
-    }
-
-    /* Buttons */
-    .stButton > button, .stDownloadButton > button {
-        border-radius: 8px;
-        border: 1px solid var(--border);
-        background: var(--surface);
-        color: var(--text);
-        font-weight: 500;
-        font-size: 0.88rem;
-        min-height: 2.35rem;
-        box-shadow: none;
-        transition: border-color 120ms ease, background 120ms ease;
-    }
-    .stButton > button:hover {
-        border-color: var(--accent);
-        background: var(--accent-soft);
-        color: var(--accent);
-    }
-
-    [data-testid="stSidebar"] .stButton > button {
-        background: transparent;
-        border: 1px solid transparent;
-        color: var(--sidebar-text);
-        text-align: left;
-        justify-content: flex-start;
-        font-size: 0.85rem;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        display: block;
-    }
-    [data-testid="stSidebar"] .stButton > button:hover {
-        border-color: var(--sidebar-border);
-        background: var(--sidebar-active);
-        color: #ffffff;
-    }
-    [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-        background: var(--sidebar-active);
-        border-color: #34343a;
-        color: #ffffff;
-        font-weight: 600;
-    }
-
-    /* Chat messages */
-    [data-testid="stChatMessage"] {
-        background: var(--surface);
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        padding: 0.15rem 0.35rem;
-        margin-bottom: 0.6rem;
-    }
-    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p,
-    [data-testid="stChatMessage"] [data-testid="stText"] {
-        font-size: 0.94rem;
-        line-height: 1.55;
-        color: var(--text);
-    }
-
-    /* Chat input */
-    [data-testid="stChatInputTextArea"] textarea {
-        background: var(--surface);
-        border-radius: var(--radius);
-        border: 1px solid var(--border);
-        font-size: 0.92rem;
-    }
-    [data-testid="stChatInputTextArea"] textarea:focus {
-        border-color: var(--accent);
-        box-shadow: 0 0 0 1px var(--accent);
-    }
-    [data-testid="stChatInputFileUploader"] {
-        background: var(--surface);
-        border-radius: 8px;
-        border: 1px dashed var(--border);
-    }
-
-    div[data-testid="stBottomBlockContainer"] {
-        max-width: 860px;
-        margin: 0 auto;
-        padding-left: 1rem;
-        padding-right: 1rem;
-        background: transparent;
-        border-top: 1px solid var(--border);
-    }
-
-    /* Status / expander boxes */
-    [data-testid="stExpander"] {
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        background: var(--surface);
-    }
-
-    @media (max-width: 900px) {
-        .block-container {
-            padding-top: 1.1rem;
-            padding-bottom: 6rem;
-        }
-        .app-header {
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0.2rem;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.markdown(
-    f"""
-    <div class="app-header">
-        <h1> Chat Assistant</h1>
-        <span class="meta">{len(message_history)} messages · thread {current_thread_id[:8]}</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-if latest_doc:
-    st.markdown(
-        f"""
-        <div class="doc-status active">
-            <span class="dot"></span>
-            Reading <strong>{latest_doc.get('filename')}</strong>
-            — {latest_doc.get('chunks')} chunks from {latest_doc.get('documents')} pages
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        """
-        <div class="doc-status idle">
-            <span class="dot"></span>
-            No document attached — attach a PDF from the message box to ask about it
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-st.sidebar.markdown("### Resume Chat")
-st.sidebar.caption(f"Signed in as {current_user['name']}")
-
-if st.sidebar.button("Logout", use_container_width=True):
-    st.session_state.auth_user = None
-    st.session_state.message_history = []
-    st.session_state.pending_prompt = None
-    st.session_state.pop("thread_id", None)
-    st.session_state.pop("chat_thread", None)
-    st.rerun()
-
-if st.sidebar.button("＋ New conversation", use_container_width=True):
-    reset_chat(current_user_id)
-    st.rerun()
-
-if st.sidebar.button("Clear current chat", use_container_width=True):
-    st.session_state.message_history = []
-    st.rerun()
-
-st.sidebar.divider()
-st.sidebar.markdown("### History")
-
-for thread_id in st.session_state["chat_thread"][::-1]:
-    title = get_thread_title(thread_id)
-    is_active = thread_id == current_thread_id
-    if st.sidebar.button(
-        title,
-        key=f"thread_{thread_id}",
-        use_container_width=True,
-        type="primary" if is_active else "secondary",
-    ):
-        if not is_active:
-            select_thread(thread_id)
+        st.divider()
+        if st.button("Sign out", icon=":material/logout:", use_container_width=True):
+            for key in list(st.session_state):
+                del st.session_state[key]
             st.rerun()
 
-# ---------------------------------------------------------------------------
-# Chat history / empty state
-# ---------------------------------------------------------------------------
-if not message_history:
-    st.markdown(
-        """
-        <div class="empty-state">
-            <div class="icon">📄</div>
-            <h3>Start by attaching your resume</h3>
-            <p>Upload a PDF from the message box below, or just ask a question to get going.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    prompt_cols = st.columns(2)
-    for i, prompt in enumerate(SUGGESTED_PROMPTS):
-        with prompt_cols[i % 2]:
-            if st.button(prompt, key=f"suggested_{i}", use_container_width=True):
-                st.session_state.pending_prompt = prompt
-                st.rerun()
-else:
-    for message in message_history:
-        avatar = USER_AVATAR if message["role"] == "user" else ASSISTANT_AVATAR
-        with st.chat_message(message["role"], avatar=avatar):
-            st.text(message["content"])
 
-chat_submission = st.chat_input(
-    "Ask about your resume, skills, projects, or request improvements...",
-    accept_file=True,
-    file_type=["pdf"],
-    key=f"chat_input_{current_thread_id}",
-)
+def ingest_uploaded_file(uploaded_file: Any, thread_id: str) -> None:
+    """Index changed content once per thread, not merely once per filename."""
+    data = uploaded_file.getvalue()
+    digest = hashlib.sha256(data).hexdigest()
+    existing = st.session_state.ingested_docs.get(thread_id)
+    if existing and existing["digest"] == digest:
+        return
+    started = perf_counter()
+    with st.status("Indexing PDF...", expanded=False) as status:
+        try:
+            summary = backend.ingest_pdf(data, thread_id, uploaded_file.name)
+        except Exception:
+            status.update(label="PDF could not be indexed", state="error")
+            raise
+        st.session_state.ingested_docs[thread_id] = {"digest": digest, **summary}
+        status.update(label="PDF ready", state="complete")
+    logger.info("ingestion_seconds=%.3f", perf_counter() - started)
 
-# A clicked suggested prompt behaves exactly like typed input.
-if chat_submission is None and st.session_state.pending_prompt:
-    chat_submission = st.session_state.pending_prompt
-    st.session_state.pending_prompt = None
 
-if chat_submission:
-    if isinstance(chat_submission, str):
-        user_input = chat_submission
-        uploaded_files = []
-    else:
-        user_input = chat_submission.text.strip()
-        uploaded_files = chat_submission.files
+def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
+    """Stream the unchanged graph and record client-observed latency."""
+    started = perf_counter()
+    sources: list[dict[str, Any]] = []
+    first_token: float | None = None
+    answer_parts: list[str] = []
+    status = st.status("Thinking...", expanded=False)
 
-    if uploaded_files:
-        summary = ingest_uploaded_file(uploaded_files[0], current_thread_id, thread_docs)
-        latest_doc = summary or latest_doc
-        if not user_input:
-            user_input = "Please review the uploaded PDF and answer questions based on it."
+    def tokens() -> Iterator[str]:
+        nonlocal first_token
+        for mode, event in backend.chatbot.stream(
+            {"messages": [HumanMessage(content=user_input)]},
+            config=build_config(thread_id), stream_mode=["messages", "updates"],
+        ):
+            if mode == "updates":
+                for update in event.values():
+                    if not isinstance(update, dict):
+                        continue
+                    for message in update.get("messages", []):
+                        if isinstance(message, AIMessage) and message.tool_calls:
+                            names = ", ".join(call["name"] for call in message.tool_calls)
+                            status.update(label=f"Using {names}...")
+                        elif isinstance(message, ToolMessage):
+                            retrieved = extract_sources(message)
+                            sources.extend(retrieved)
+                            if message.name == "rag_tool" and not retrieved:
+                                st.info("No PDF sources were returned for this question.")
+                            status.update(label="Preparing answer...")
+            else:
+                message, metadata = event
+                if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content:
+                    if first_token is None:
+                        first_token = perf_counter() - started
+                        logger.info("time_to_first_token_seconds=%.3f", first_token)
+                    answer_parts.append(message.content)
+                    yield message.content
 
-    if not user_input:
-        st.info("Add a message or attach a PDF to continue.")
-        st.stop()
+    error = False
+    try:
+        st.write_stream(tokens())
+        if answer_parts:
+            status.update(label="Complete", state="complete")
+        else:
+            error = True
+            status.update(label="No answer received", state="error")
+            st.warning("No answer text was returned. Please try a new conversation.")
+    except Exception:
+        error = True
+        logger.exception("chat_turn_failed")
+        status.update(label="Response interrupted", state="error")
+        st.error("The response could not finish. Check your connection and API configuration. Start a new conversation if this chat cannot continue.")
+    total = perf_counter() - started
+    logger.info("total_response_seconds=%.3f success=%s", total, not error)
+    return {"role": "assistant", "content": "".join(answer_parts), "sources": sources,
+            "timing": {"first_token": first_token, "total": total}, "error": error}
 
-    message_history.append({"role": "user", "content": user_input})
-    with st.chat_message("user", avatar=USER_AVATAR):
-        st.text(user_input)
 
-    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-        status_holder = {"box": None}
+def render_answer_details(message: dict[str, Any]) -> None:
+    render_sources(message.get("sources", []))
+    if message.get("error"):
+        st.caption("Incomplete response")
+    if message.get("content"):
+        with st.expander("Copy answer"):
+            st.code(message["content"], language=None, wrap_lines=True)
+    if st.session_state.get("show_timings") and message.get("timing"):
+        timing = message["timing"]
+        first = timing["first_token"]
+        st.caption(f"First text: {first:.2f}s | Total: {timing['total']:.2f}s" if first is not None
+                   else f"Total: {timing['total']:.2f}s | No text received")
 
-        def ai_only_stream():
-            for message_chunk, metadata in chatbot.stream(
-                {"messages": [HumanMessage(content=user_input)]},
-                config=config,
-                stream_mode="messages",
-            ):
-                if isinstance(message_chunk, ToolMessage):
-                    tool_name = getattr(message_chunk, "name", "tool")
-                    if status_holder["box"] is None:
-                        status_holder["box"] = st.status(
-                            f"Using `{tool_name}`", expanded=True
-                        )
-                    else:
-                        status_holder["box"].update(
-                            label=f"Using `{tool_name}`",
-                            state="running",
-                            expanded=True,
-                        )
 
-                if isinstance(message_chunk, AIMessage) and isinstance(message_chunk.content, str):
-                    yield message_chunk.content
+def render_chat() -> None:
+    thread_id = st.session_state.thread_id
+    st.title("Resume Chat")
+    doc = st.session_state.ingested_docs.get(thread_id)
+    doc_status = st.empty()
+    doc_status.caption(f"{doc['filename']} | {doc['documents']} pages" if doc else "No PDF attached")
+    history = st.session_state.message_history
+    welcome = st.empty()
+    if not history:
+        with welcome.container():
+            st.subheader("What would you like to work on?")
+            for index, column in enumerate(st.columns(2)):
+                with column:
+                    for prompt in SUGGESTED_PROMPTS[index::2]:
+                        if st.button(prompt, use_container_width=True):
+                            st.session_state.pending_prompt = prompt
+    for message in history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                render_answer_details(message)
+    submission = st.chat_input("Ask a question or attach a PDF", accept_file=True, file_type=["pdf"],
+                               key=f"input_{thread_id}")
+    pending = st.session_state.pop("pending_prompt", None)
+    if submission is None and not pending:
+        return
+    text = (submission if isinstance(submission, str) else submission.text) if submission is not None else pending
+    text = (text or "").strip()
+    files = getattr(submission, "files", [])
+    if files:
+        try:
+            ingest_uploaded_file(files[0], thread_id)
+        except Exception:
+            logger.exception("pdf_ingestion_failed")
+            st.error("Could not read this PDF. Use an unencrypted PDF with selectable text and try again.")
+            return
+        doc = st.session_state.ingested_docs[thread_id]
+        doc_status.caption(f"{doc['filename']} | {doc['documents']} pages")
+        text = text or "Please review the uploaded PDF and answer questions based on it."
+    if not text:
+        st.info("Enter a message or attach a PDF.")
+        return
+    welcome.empty()
+    history.append({"role": "user", "content": text})
+    with st.chat_message("user"):
+        st.markdown(text)
+    with st.chat_message("assistant"):
+        answer = stream_answer(text, thread_id)
+        render_answer_details(answer)
+    history.append(answer)
+    st.session_state.thread_titles.setdefault(thread_id, text[:40])
 
-        ai_message = st.write_stream(ai_only_stream())
 
-        if status_holder["box"] is not None:
-            status_holder["box"].update(
-                label="Tool finished", state="complete", expanded=False
-            )
+def main() -> None:
+    """Authenticate, restore user state, then render the native chat interface."""
+    global backend
+    init_auth_db()
+    if not st.session_state.get("auth_user"):
+        render_auth()
+        return
+    try:
+        with st.spinner("Connecting..."):
+            backend = load_backend()
+    except Exception:
+        logger.exception("backend_initialization_failed")
+        st.error("Could not start the assistant. Check GROQ_API_KEY and the installed dependencies.")
+        return
+    user = st.session_state.auth_user
+    for key, default in {"chat_thread": [], "thread_titles": {}, "ingested_docs": {},
+                         "message_history": [], "show_timings": False}.items():
+        st.session_state.setdefault(key, default)
+    sync_threads(user["id"])
+    if not is_user_thread(st.session_state.get("thread_id", ""), user["id"]):
+        if st.session_state.chat_thread:
+            select_thread(st.session_state.chat_thread[-1])
+        else:
+            reset_chat(user["id"])
+    render_sidebar(user)
+    with st.container(horizontal_alignment="center"):
+        with st.container(width=900):
+            render_chat()
 
-    message_history.append({"role": "assistant", "content": ai_message})
+
+if __name__ == "__main__":
+    main()

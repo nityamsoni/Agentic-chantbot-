@@ -24,6 +24,11 @@ import requests
 import os
 import tempfile
 import sqlite3
+import logging
+from time import perf_counter
+import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 _THREAD_RETRIEVERS: Dict[str, Any] = {}
 _THREAD_METADATA: Dict[str, dict] = {}
@@ -33,13 +38,18 @@ model = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0.7,
+    timeout=60,
+    max_retries=2,
 )
 
 
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+@st.cache_resource(show_spinner=False)
+def get_embeddings() -> HuggingFaceEmbeddings:
+    """Load the shared embedding model on the first PDF upload."""
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
 
 def _get_retriever(thread_id: Optional[str]):
     """Fetch the retriever for a thread if available."""
@@ -70,7 +80,9 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
         )
         chunks = splitter.split_documents(docs)
 
-        vector_store = FAISS.from_documents(chunks, embeddings)
+        if not chunks:
+            raise ValueError("No readable text found. Please upload a text-based PDF.")
+        vector_store = FAISS.from_documents(chunks, get_embeddings())
         retriever = vector_store.as_retriever(
             search_type="similarity", search_kwargs={"k": 4}
         )
@@ -140,8 +152,14 @@ def calculator(first_num: float, second_num: float, operation: str) -> dict:
 def get_stock_price(symbol: str) -> dict:
     """..."""
     try:
-        url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=H43T0WRCT38OGZ3A"
-        r = requests.get(url, timeout=10)
+        api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+        if not api_key:
+            return {"error": "Stock lookup is unavailable: ALPHAVANTAGE_API_KEY is not configured."}
+        r = requests.get(
+            "https://www.alphavantage.co/query",
+            params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": api_key},
+            timeout=10,
+        )
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -164,7 +182,11 @@ def rag_tool(query: str, config: RunnableConfig) -> dict:
             "query": query,
         }
 
-    result = retriever.invoke(query)
+    started = perf_counter()
+    try:
+        result = retriever.invoke(query)
+    finally:
+        logger.info("retrieval_seconds=%.3f", perf_counter() - started)
     context = [doc.page_content for doc in result]
     metadata = [doc.metadata for doc in result]
 
