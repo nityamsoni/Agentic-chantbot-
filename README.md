@@ -33,6 +33,10 @@ These are code-based findings, not measured production bottlenecks.
 
 - Native centered chat, light teal theme, account selector, sidebar settings,
   example questions, Markdown responses, copy expanders, and source previews.
+- Empty chats show a centered inline composer. After the first answer, one
+  UI-only rerun moves it to Streamlit's native bottom region without repeating
+  the model request. Active chat messages stay above it; clearing starts the
+  centered layout again. Stream failures remain visible after layout reruns.
 - Backend import deferred until authentication. MiniLM is lazy and cached with
   `st.cache_resource`, loading on the first PDF upload. The graph is shared as
   before; user conversations retain distinct thread IDs.
@@ -82,11 +86,13 @@ is retained, not replaced with a production identity provider.
 .\myenv\Scripts\python.exe -m unittest test_frontend -v
 ```
 
-The seven isolated tests use a fake graph and temporary account databases,
+The eight isolated tests use a fake graph and temporary account databases,
 covering registration/login, streaming, restored sources, title caching,
 clear-chat isolation, API errors, user filtering, logout, malformed sources,
 safe checkpoint-database failure handling and retry, and real SQLite saver
 selection of a fresh database without modifying a damaged file.
+Composer coverage checks inline-to-bottom placement, exactly one input, no
+duplicate first turn, continued pinning, and reset to center after clear.
 They make no external API calls and do not download embeddings. Live Groq,
 real PDF embedding, and multi-user load performance need separate validation.
 

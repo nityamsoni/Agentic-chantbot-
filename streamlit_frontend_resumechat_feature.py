@@ -351,7 +351,6 @@ def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
         error = True
         logger.exception("chat_turn_failed")
         status.update(label="Response interrupted", state="error")
-        st.error("The response could not finish. Check your connection and API configuration. Start a new conversation if this chat cannot continue.")
     total = perf_counter() - started
     logger.info("total_response_seconds=%.3f success=%s", total, not error)
     return {"role": "assistant", "content": "".join(answer_parts), "sources": sources,
@@ -361,7 +360,7 @@ def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
 def render_answer_details(message: dict[str, Any]) -> None:
     render_sources(message.get("sources", []))
     if message.get("error"):
-        st.caption("Incomplete response")
+        st.error("The response could not finish. Check your connection and API configuration. Start a new conversation if this chat cannot continue.")
     if message.get("content"):
         with st.expander("Copy answer"):
             st.code(message["content"], language=None, wrap_lines=True)
@@ -372,29 +371,45 @@ def render_answer_details(message: dict[str, Any]) -> None:
                    else f"Total: {timing['total']:.2f}s | No text received")
 
 
+def render_composer(thread_id: str) -> Any:
+    """Render one PDF-enabled composer in the caller's layout context."""
+    return st.chat_input(
+        "Ask a question or attach a PDF", accept_file=True, file_type=["pdf"],
+        key=f"input_{thread_id}",
+    )
+
+
 def render_chat() -> None:
+    """Center the empty composer and pin it below an active conversation."""
     thread_id = st.session_state.thread_id
-    st.title("Resume Chat")
-    doc = st.session_state.ingested_docs.get(thread_id)
-    doc_status = st.empty()
-    doc_status.caption(f"{doc['filename']} | {doc['documents']} pages" if doc else "No PDF attached")
     history = st.session_state.message_history
-    welcome = st.empty()
-    if not history:
-        with welcome.container():
-            st.subheader("What would you like to work on?")
-            for index, column in enumerate(st.columns(2)):
-                with column:
-                    for prompt in SUGGESTED_PROMPTS[index::2]:
-                        if st.button(prompt, use_container_width=True):
-                            st.session_state.pending_prompt = prompt
-    for message in history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message["role"] == "assistant":
-                render_answer_details(message)
-    submission = st.chat_input("Ask a question or attach a PDF", accept_file=True, file_type=["pdf"],
-                               key=f"input_{thread_id}")
+    had_history = bool(history)
+    submission = None
+    with st.container(horizontal_alignment="center"):
+        with st.container(width=900):
+            st.title("Resume Chat")
+            doc = st.session_state.ingested_docs.get(thread_id)
+            doc_status = st.empty()
+            doc_status.caption(f"{doc['filename']} | {doc['documents']} pages" if doc else "No PDF attached")
+            welcome = st.empty()
+            if not had_history:
+                with welcome.container():
+                    with st.container(height=420, border=False, vertical_alignment="center"):
+                        st.subheader("What would you like to work on?")
+                        submission = render_composer(thread_id)
+                        for index, column in enumerate(st.columns(2)):
+                            with column:
+                                for prompt in SUGGESTED_PROMPTS[index::2]:
+                                    if st.button(prompt, use_container_width=True):
+                                        st.session_state.pending_prompt = prompt
+            for message in history:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+                    if message["role"] == "assistant":
+                        render_answer_details(message)
+            turn = st.container()
+    if had_history:
+        submission = render_composer(thread_id)
     pending = st.session_state.pop("pending_prompt", None)
     if submission is None and not pending:
         return
@@ -403,26 +418,30 @@ def render_chat() -> None:
     files = getattr(submission, "files", [])
     if files:
         try:
-            ingest_uploaded_file(files[0], thread_id)
+            with turn:
+                ingest_uploaded_file(files[0], thread_id)
         except Exception:
             logger.exception("pdf_ingestion_failed")
-            st.error("Could not read this PDF. Use an unencrypted PDF with selectable text and try again.")
+            turn.error("Could not read this PDF. Use an unencrypted PDF with selectable text and try again.")
             return
         doc = st.session_state.ingested_docs[thread_id]
         doc_status.caption(f"{doc['filename']} | {doc['documents']} pages")
         text = text or "Please review the uploaded PDF and answer questions based on it."
     if not text:
-        st.info("Enter a message or attach a PDF.")
+        turn.info("Enter a message or attach a PDF.")
         return
     welcome.empty()
     history.append({"role": "user", "content": text})
-    with st.chat_message("user"):
-        st.markdown(text)
-    with st.chat_message("assistant"):
-        answer = stream_answer(text, thread_id)
-        render_answer_details(answer)
+    with turn:
+        with st.chat_message("user"):
+            st.markdown(text)
+        with st.chat_message("assistant"):
+            answer = stream_answer(text, thread_id)
+            render_answer_details(answer)
     history.append(answer)
     st.session_state.thread_titles.setdefault(thread_id, text[:40])
+    if not had_history:
+        st.rerun()
 
 
 def main() -> None:
@@ -451,9 +470,7 @@ def main() -> None:
             else:
                 reset_chat(user["id"])
         render_sidebar(user)
-        with st.container(horizontal_alignment="center"):
-            with st.container(width=900):
-                render_chat()
+        render_chat()
     except sqlite3.DatabaseError as error:
         logger.exception(
             "checkpoint_database_error sqlite_errorname=%s sqlite_errorcode=%s",

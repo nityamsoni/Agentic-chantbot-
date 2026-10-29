@@ -113,6 +113,33 @@ class FrontendTests(unittest.TestCase):
         self.assert_clean()
         self.assertEqual(self.app.session_state["message_history"][-1]["sources"][0]["filename"], "resume.pdf")
 
+    def test_composer_moves_to_bottom_after_first_answer(self) -> None:
+        def composer_paths(node, path=()):
+            found = [path] if getattr(node, "type", None) == "chat_input" else []
+            for key, child in getattr(node, "children", {}).items():
+                found.extend(composer_paths(child, path + (key,)))
+            return found
+
+        self.login()
+        self.assertEqual(len(self.app.chat_input), 1)
+        self.assertEqual(composer_paths(self.app._tree)[0][0], 0)
+        self.app.chat_input[0].set_value("Review skills").run()
+        self.assert_clean()
+        self.assertEqual(len(self.app.chat_input), 1)
+        self.assertEqual(composer_paths(self.app._tree)[0][0], 3)
+        thread_id = self.app.session_state["thread_id"]
+        self.assertEqual(sum(isinstance(message, HumanMessage)
+                             for message in self.graph.messages[thread_id]), 1)
+        self.app.chat_input[0].set_value("What else?").run()
+        self.assert_clean()
+        self.assertEqual(composer_paths(self.app._tree)[0][0], 3)
+        self.assertEqual(len(self.app.session_state["message_history"]), 4)
+        clear = next(button for button in self.app.button if button.label == "Clear current chat")
+        clear.click().run()
+        self.assert_clean()
+        self.assertEqual(len(self.app.chat_input), 1)
+        self.assertEqual(composer_paths(self.app._tree)[0][0], 0)
+
     def test_stream_failure(self) -> None:
         self.login()
         self.graph.fail = True
