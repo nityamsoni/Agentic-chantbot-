@@ -1,11 +1,14 @@
 import ast
 import json
 import logging
+import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import streamlit as st
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -118,6 +121,57 @@ class FrontendTests(unittest.TestCase):
         self.assert_clean()
         self.assertTrue(self.app.error)
         self.assertTrue(self.app.session_state["message_history"][-1]["error"])
+
+    def test_checkpoint_database_error(self) -> None:
+        def broken_history():
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        self.backend.retrive_threads = broken_history
+        self.app.session_state["auth_user"] = {"id": 1, "name": "Test User"}
+        with self.assertLogs(level=logging.ERROR) as logs:
+            self.app.run()
+        self.assert_clean()
+        self.assertTrue(self.app.error)
+        self.assertIn("database disk image is malformed", "\n".join(logs.output))
+        self.assertEqual(len(self.app.chat_input), 0)
+        self.assertEqual(self.graph.messages, {})
+        self.backend.retrive_threads = lambda: []
+        next(button for button in self.app.button if button.label == "Retry storage").click().run()
+        self.assert_clean()
+        self.assertEqual(len(self.app.chat_input), 1)
+        self.assertFalse(self.app.error)
+
+    def test_explicit_checkpoint_database_path(self) -> None:
+        from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        from typing import Any, Optional
+
+        source = Path(__file__).with_name("langchain_backend.py").read_text(encoding="utf-8")
+        node = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "create_checkpointer")
+        namespace = {"Any": Any, "Optional": Optional, "sqlite3": sqlite3, "os": os,
+                     "MemorySaver": MemorySaver, "SqliteSaver": SqliteSaver}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<checkpoint-test>", "exec"), namespace)
+        original = Path(self.temp.name) / "chatbot.db"
+        damaged_content = b"damaged database fixture"
+        original.write_bytes(damaged_content)
+        replacement = Path(self.temp.name) / "chatbot-fresh.db"
+        with patch.dict(os.environ, {"CHATBOT_DB_PATH": str(replacement)}):
+            saver, connection = namespace["create_checkpointer"]()
+            try:
+                self.assertEqual(list(saver.list(None)), [])
+                self.assertEqual(connection.execute("PRAGMA quick_check").fetchall(), [("ok",)])
+            finally:
+                connection.close()
+        self.assertEqual(original.read_bytes(), damaged_content)
+        with patch.dict(os.environ, {"CHATBOT_DB_PATH": str(original)}):
+            saver, connection = namespace["create_checkpointer"]()
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    list(saver.list(None))
+            finally:
+                connection.close()
+        self.assertEqual(original.read_bytes(), damaged_content)
 
     def test_thread_filtering_and_logout(self) -> None:
         self.graph.messages = {"u2:private": [HumanMessage(content="Private")],

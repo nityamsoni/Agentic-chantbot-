@@ -229,13 +229,16 @@ def chat_message(state:WorkflowState) -> WorkflowState:
        return {'messages': [response]}
        
 
-if SqliteSaver is not None:
-    conn = sqlite3.connect("chatbot.db", check_same_thread=False)
-    checkpointer = SqliteSaver(conn=conn)
-else:
-    # Fallback keeps app booting on platforms where sqlite checkpoint extras are missing.
-    conn = None
-    checkpointer = MemorySaver()
+def create_checkpointer() -> tuple[Any, Optional[sqlite3.Connection]]:
+    """Use the configured database without deleting or replacing existing files."""
+    if SqliteSaver is None:
+        return MemorySaver(), None
+    database_path = os.getenv("CHATBOT_DB_PATH", "chatbot.db")
+    connection = sqlite3.connect(database_path, check_same_thread=False)
+    return SqliteSaver(conn=connection), connection
+
+
+checkpointer, conn = create_checkpointer()
 stategraph=StateGraph(WorkflowState)
 
 stategraph.add_node("chat_node",chat_node)

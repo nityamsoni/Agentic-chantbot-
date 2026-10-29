@@ -82,8 +82,57 @@ is retained, not replaced with a production identity provider.
 .\myenv\Scripts\python.exe -m unittest test_frontend -v
 ```
 
-The five isolated AppTests use a fake graph and temporary account databases,
+The seven isolated tests use a fake graph and temporary account databases,
 covering registration/login, streaming, restored sources, title caching,
-clear-chat isolation, API errors, user filtering, logout, and malformed sources.
+clear-chat isolation, API errors, user filtering, logout, malformed sources,
+safe checkpoint-database failure handling and retry, and real SQLite saver
+selection of a fresh database without modifying a damaged file.
 They make no external API calls and do not download embeddings. Live Groq,
 real PDF embedding, and multi-user load performance need separate validation.
+
+## Cloud SQLite Errors
+
+If saved history cannot load, the app stops chat initialization, keeps the
+database unchanged, and offers **Retry storage**. It does not silently replace
+SQLite with an in-memory store or treat a failed query as an empty history.
+
+In Streamlit Cloud, open **Manage app > Logs** and find
+`checkpoint_database_error`. The log includes the original exception and the
+SQLite result name/code when available. The public redacted traceback alone
+cannot distinguish a malformed database, incompatible schema, file permission
+problem, or lock. Retry is for transient failures; it does not repair corruption.
+
+Back up deployed database files before any repair or replacement. Do not delete
+them or edit their schema based only on the redacted traceback. Diagnose the
+specific SQLite error first. Repository edits do not repair an existing deployed
+database, and Streamlit Cloud local storage should not be treated as durable
+long-term storage.
+
+### Confirmed Malformed Database
+
+`DatabaseError: database disk image is malformed` confirms corruption in the
+checkpoint database. Retrying, adjusting the model, or reinstalling packages
+does not repair that file. The logs do not establish how it became corrupted.
+
+If old chats matter, back up the deployed database before restarting or
+redeploying. Obtain a consistent backup with writers stopped, including any
+associated WAL files. A separate local database is not a backup of the cloud
+database. Recovery should operate on a copy, not the only original.
+
+If you explicitly accept starting with empty chat history, deploy the updated
+backend and set this root-level value in Streamlit Cloud app secrets:
+
+```toml
+CHATBOT_DB_PATH = "chatbot_fresh.db"
+```
+
+Place it outside any TOML table. Streamlit exposes root-level secrets as
+environment variables. Choose a filename that does not already exist. Reboot
+the app to discard the cached backend and open the new file. Accounts still
+use the existing auth database; previous conversations are not migrated to
+the fresh checkpoint file. This changes neither the model nor retrieval.
+
+The default remains `chatbot.db` when the variable is unset. No automatic
+reset, replacement, or recovery is performed. Changing the path does not
+overwrite the damaged file, but Cloud runtime files are still ephemeral:
+do not rely on a reboot or redeploy to preserve your only backup.

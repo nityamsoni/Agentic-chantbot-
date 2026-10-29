@@ -443,16 +443,28 @@ def main() -> None:
     for key, default in {"chat_thread": [], "thread_titles": {}, "ingested_docs": {},
                          "message_history": [], "show_timings": False}.items():
         st.session_state.setdefault(key, default)
-    sync_threads(user["id"])
-    if not is_user_thread(st.session_state.get("thread_id", ""), user["id"]):
-        if st.session_state.chat_thread:
-            select_thread(st.session_state.chat_thread[-1])
-        else:
-            reset_chat(user["id"])
-    render_sidebar(user)
-    with st.container(horizontal_alignment="center"):
-        with st.container(width=900):
-            render_chat()
+    try:
+        sync_threads(user["id"])
+        if not is_user_thread(st.session_state.get("thread_id", ""), user["id"]):
+            if st.session_state.chat_thread:
+                select_thread(st.session_state.chat_thread[-1])
+            else:
+                reset_chat(user["id"])
+        render_sidebar(user)
+        with st.container(horizontal_alignment="center"):
+            with st.container(width=900):
+                render_chat()
+    except sqlite3.DatabaseError as error:
+        logger.exception(
+            "checkpoint_database_error sqlite_errorname=%s sqlite_errorcode=%s",
+            getattr(error, "sqlite_errorname", "unknown"),
+            getattr(error, "sqlite_errorcode", "unknown"),
+        )
+        st.error("Chat storage is unavailable. Saved conversations could not be loaded safely.")
+        st.caption("The database has not been reset. The app owner should check Manage app > Logs for checkpoint_database_error before attempting a repair.")
+        if st.button("Retry storage", icon=":material/refresh:"):
+            st.session_state.pop("threads_refreshed", None)
+            st.rerun()
 
 
 if __name__ == "__main__":
