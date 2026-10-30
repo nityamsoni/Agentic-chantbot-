@@ -374,11 +374,12 @@ def stream_answer(user_input: str, thread_id: str, *, resume: bool = False) -> d
     first_token: float | None = None
     answer_parts: list[str] = []
     memory_saved = False
+    memory_problem = ""
     failure: dict[str, Any] = {}
     status = st.status("Thinking...", expanded=False)
 
     def tokens() -> Iterator[str]:
-        nonlocal first_token, memory_saved
+        nonlocal first_token, memory_saved, memory_problem
         for mode, event in backend.chatbot.stream(
             None if resume else {"messages": [HumanMessage(content=user_input)]},
             config=build_config(thread_id), stream_mode=["messages", "updates"],
@@ -396,10 +397,13 @@ def stream_answer(user_input: str, thread_id: str, *, resume: bool = False) -> d
                                 try:
                                     result = json.loads(message.content)
                                 except ValueError:
-                                    result = {}
+                                    result = {"saved": False, "error": "The save request was invalid."}
                                 if isinstance(result, dict) and result.get("saved") is True:
                                     memory_saved = True
                                     st.session_state.memory_notice = "Memory saved"
+                                elif isinstance(result, dict) and result.get("error"):
+                                    memory_problem = str(result["error"])
+                                    st.session_state.memory_notice = f"Not saved: {memory_problem}"
                             retrieved = extract_sources(message)
                             sources.extend(retrieved)
                             if message.name == "rag_tool" and not retrieved:
@@ -422,7 +426,10 @@ def stream_answer(user_input: str, thread_id: str, *, resume: bool = False) -> d
         else:
             error = True
             status.update(label="No answer received", state="error")
-            st.warning("No answer text was returned. Please try a new conversation.")
+            if memory_problem:
+                failure = {"error_message": f"Memory was not saved: {memory_problem} Rephrase it as a single 'Remember that ...' request."}
+            else:
+                st.warning("No answer text was returned. Please try a new conversation.")
     except Exception as failure_error:
         error = True
         reference = uuid.uuid4().hex[:8]
@@ -439,7 +446,7 @@ def stream_answer(user_input: str, thread_id: str, *, resume: bool = False) -> d
     logger.info("total_response_seconds=%.3f success=%s", total, not error)
     return {"role": "assistant", "content": "".join(answer_parts), "sources": sources,
             "timing": {"first_token": first_token, "total": total}, "error": error,
-            "memory_saved": memory_saved, **failure}
+            "memory_saved": memory_saved, "memory_problem": memory_problem, **failure}
 
 
 def render_answer_details(message: dict[str, Any], *, allow_retry: bool = False) -> None:
@@ -548,7 +555,7 @@ def render_chat() -> None:
             render_answer_details(answer)
     history.append(answer)
     st.session_state.thread_titles.setdefault(thread_id, text[:40])
-    if not had_history or answer.get("memory_saved") or answer.get("error_kind") == "rate_limit":
+    if not had_history or answer.get("memory_saved") or answer.get("memory_problem") or answer.get("error_kind") == "rate_limit":
         st.rerun()
 
 

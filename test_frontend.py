@@ -27,6 +27,7 @@ class FakeGraph:
         self.reads = 0
         self.configs = []
         self.save_requested = False
+        self.save_arguments = ("My target role is GenAI Engineer", "target_role")
         self.memory_store = None
 
     def get_state(self, config):
@@ -42,8 +43,10 @@ class FakeGraph:
         if self.fail:
             raise TimeoutError("Simulated timeout")
         if self.save_requested:
-            result = save_user_fact(self.memory_store, config, messages,
-                                    "My target role is GenAI Engineer", "target_role")
+            try:
+                result = save_user_fact(self.memory_store, config, messages, *self.save_arguments)
+            except ValueError as error:
+                result = {"saved": False, "error": str(error)}
             yield "updates", {"tools": {"messages": [ToolMessage(
                 content=json.dumps(result), name="save_memory", tool_call_id="memory-one",
             )]}}
@@ -135,6 +138,19 @@ class FrontendTests(unittest.TestCase):
         self.app.chat_input[0].set_value("Hello").run()
         self.assert_clean()
         self.assertFalse(self.graph.configs[-1]["configurable"]["memory_enabled"])
+
+    def test_rejected_memory_save_shows_reason(self) -> None:
+        self.login()
+        self.app.toggle(key="memory_enabled").set_value(True).run()
+        self.graph.save_requested = True
+        self.graph.save_arguments = ("My target role is Google Engineer", "target_role")
+        self.app.chat_input[0].set_value("Remember that My target role is Engineer").run()
+        self.assert_clean()
+        toasts = self.app.get("toast")
+        self.assertEqual(len(toasts), 1)
+        self.assertTrue(toasts[0].value.startswith("Not saved: "), toasts[0].value)
+        self.assertIn("latest 'Remember that ...' request", toasts[0].value)
+        self.assertEqual(list_memories(self.memory_store, self.graph.configs[-1]), [])
 
     def test_memory_sidebar_edit_delete_clear_and_validation(self) -> None:
         self.login()

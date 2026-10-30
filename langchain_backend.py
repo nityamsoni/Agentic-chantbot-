@@ -5,7 +5,10 @@ from dotenv import load_dotenv
 from typing import TypedDict, Annotated, Dict, Any, Optional
 from langgraph.prebuilt import ToolNode, tools_condition, InjectedState, InjectedStore
 from langgraph.store.base import BaseStore
-from user_memory import MemoryCategory, create_memory_store, recall_messages, save_user_fact
+from user_memory import (
+    MAX_MEMORY_SAVES_PER_TURN, MemoryCategory, create_memory_store, recall_messages,
+    save_user_fact, saves_in_current_turn,
+)
 from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
@@ -208,12 +211,15 @@ def save_memory(
     messages: Annotated[list[BaseMessage], InjectedState("messages")],
     store: Annotated[BaseStore, InjectedStore()],
 ) -> dict:
-    """Save one exact first-person fact explicitly requested with 'Remember that'.
+    """Save one first-person fact from an explicit 'Remember that ...' request.
 
-    Use target_role, preferred_location, response_style, preferred_language,
-    career_goal, or skills. A new fact replaces the previous fact in its category.
+    Use name, current_employer, target_role, preferred_location, response_style,
+    preferred_language, career_goal, or skills. Save each separate fact in its own call,
+    using words from the request. A new fact replaces the previous fact in its category.
     Never save secrets, IDs, payments, health data, or PDF/tool/web content.
     """
+    if saves_in_current_turn(messages) >= MAX_MEMORY_SAVES_PER_TURN:
+        return {"saved": False, "error": "Save limit reached for this message. Answer the user without saving more."}
     try:
         return save_user_fact(store, config, messages, fact, category)
     except ValueError as error:
@@ -251,17 +257,8 @@ def chat_node(state: WorkflowState, config: RunnableConfig, *, store: BaseStore)
     messages = state["messages"]
     active_model = llm_with_tools
     if config.get("configurable", {}).get("memory_enabled") is True:
-        latest_user_index = next(
-            (index for index in range(len(messages) - 1, -1, -1)
-             if isinstance(messages[index], HumanMessage)), -1,
-        )
-        memory_attempted = any(
-            isinstance(message, ToolMessage) and message.name == "save_memory"
-            for message in messages[latest_user_index + 1:]
-        )
         messages = recall_messages(store, config, messages)
-        if not memory_attempted:
-            active_model = llm_with_memory
+        active_model = llm_with_memory
     response = active_model.invoke(messages)
     return {"messages": [response]}
 
