@@ -10,6 +10,8 @@ from typing import Annotated, Any, TypedDict
 import unittest
 from unittest.mock import patch
 
+import httpx
+from groq import RateLimitError
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -237,6 +239,69 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse(any(isinstance(message, SystemMessage) for message in state.values["messages"]))
         graph.invoke({"messages": [HumanMessage(content="My role?")]}, config("b"))
         self.assertNotIn("GenAI Engineer", seen[-1][0].content)
+
+    def test_memory_save_is_only_offered_once_per_user_turn(self) -> None:
+        source = ast.parse(Path(__file__).with_name("langchain_backend.py").read_text(encoding="utf-8"))
+        node = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == "chat_node")
+        called = []
+
+        class Model:
+            def __init__(self, label):
+                self.label = label
+
+            def invoke(self, messages):
+                called.append(self.label)
+                return AIMessage(content="Done")
+
+        namespace = dict(globals(), WorkflowState=dict,
+                         llm_with_memory=Model("memory"), llm_with_tools=Model("existing_tools"))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<save-guard-test>", "exec"), namespace)
+        messages = [HumanMessage(content="Remember that My target role is Engineer")]
+        namespace["chat_node"]({"messages": messages}, config(), store=self.store)
+        for result in ('{"saved":true}', '{"saved":false,"unchanged":true}', '{"saved":false,"error":"unsupported"}'):
+            continued = [*messages, ToolMessage(content=result, name="save_memory", tool_call_id="one")]
+            namespace["chat_node"]({"messages": continued}, config(), store=self.store)
+            self.assertEqual(called[-1], "existing_tools")
+        continued.append(HumanMessage(content="Remember that My target role is Designer"))
+        namespace["chat_node"]({"messages": continued}, config(), store=self.store)
+        self.assertEqual(called[-1], "memory")
+        self.assertEqual(called[0], "memory")
+
+    def test_real_checkpoint_resume_does_not_repeat_memory_write(self) -> None:
+        class RetryState(TypedDict):
+            messages: Annotated[list[BaseMessage], add_messages]
+
+        writes = []
+        attempts = []
+
+        def persist_memory(state):
+            writes.append("saved")
+            save_user_fact(self.store, config(), state["messages"],
+                           "My target role is Engineer", "target_role")
+            return {}
+
+        def model_call(state):
+            attempts.append("model")
+            if len(attempts) == 1:
+                response = httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com"))
+                raise RateLimitError("simulated", response=response, body={})
+            return {"messages": [AIMessage(content="Resumed")]}
+
+        builder = StateGraph(RetryState)
+        builder.add_node("persist_memory", persist_memory)
+        builder.add_node("chat_node", model_call)
+        builder.add_edge(START, "persist_memory")
+        builder.add_edge("persist_memory", "chat_node")
+        graph = builder.compile(checkpointer=MemorySaver(), store=self.store)
+        with self.assertRaises(RateLimitError):
+            graph.invoke({"messages": [HumanMessage(content="Remember that My target role is Engineer")]}, config())
+        self.assertEqual(graph.get_state(config()).next, ("chat_node",))
+        result = graph.invoke(None, config())
+        self.assertEqual(writes, ["saved"])
+        self.assertEqual(len(list_memories(self.store, config())), 1)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(sum(isinstance(message, HumanMessage) for message in result["messages"]), 1)
+        self.assertEqual(result["messages"][-1].content, "Resumed")
 
 
 if __name__ == "__main__":

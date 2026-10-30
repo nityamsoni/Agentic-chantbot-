@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, START
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated, Dict, Any, Optional
@@ -251,8 +251,17 @@ def chat_node(state: WorkflowState, config: RunnableConfig, *, store: BaseStore)
     messages = state["messages"]
     active_model = llm_with_tools
     if config.get("configurable", {}).get("memory_enabled") is True:
+        latest_user_index = next(
+            (index for index in range(len(messages) - 1, -1, -1)
+             if isinstance(messages[index], HumanMessage)), -1,
+        )
+        memory_attempted = any(
+            isinstance(message, ToolMessage) and message.name == "save_memory"
+            for message in messages[latest_user_index + 1:]
+        )
         messages = recall_messages(store, config, messages)
-        active_model = llm_with_memory
+        if not memory_attempted:
+            active_model = llm_with_memory
     response = active_model.invoke(messages)
     return {"messages": [response]}
 

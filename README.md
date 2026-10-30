@@ -89,7 +89,7 @@ is retained, not replaced with a production identity provider.
 .\myenv\Scripts\python.exe -m unittest test_frontend test_memory -v
 ```
 
-The 22 tests use fake models, deterministic embeddings, and temporary account databases,
+The 26 tests use fake models, deterministic embeddings, and temporary account databases,
 covering registration/login, streaming, restored sources, title caching,
 clear-chat isolation, API errors, user filtering, logout, malformed sources,
 safe checkpoint-database failure handling and retry, and real SQLite saver
@@ -104,6 +104,35 @@ the sidebar controls and saved-memory notice. They make no external API calls
 and do not download embeddings. Postgres selection/setup is mocked; no real
 Postgres server was available. Live Groq, actual MiniLM memory embeddings,
 real PDF embedding, Postgres connectivity, and multi-user load require separate validation.
+
+## Groq Rate Limits And Retry
+
+`groq.RateLimitError` / HTTP 429 means the provider's shared usage limit was
+reached, not necessarily a bad API key, network failure, or broken memory store.
+The reported Cloud failure was an 8,000 tokens-per-minute limit. The supplied
+log included many model calls and growing request sizes; it does not identify
+every tool call that contributed. Memory recall itself was completing.
+
+The UI now shows a specific rate-limit message and an error reference matching
+`chat_turn_failed error_reference=...` in server logs. After a rate-limit error,
+the composer is temporarily blocked to avoid re-appending the same prompt.
+Wait about one minute, then click **Retry response** on the latest failed answer.
+An early click sends no request. No background wait loop or automatic graph
+retry was added; the existing Groq SDK retry settings remain unchanged.
+
+Retry checks for a pending `chat_node` and resumes the saved graph with null
+input. It does not duplicate the user's message or replay completed tool work.
+New/clear chat remains an explicit alternative. Retries need a still-available
+checkpoint, and another user's shared provider usage can still produce a 429.
+A single request larger than the provider's limit cannot be fixed by waiting.
+
+To prevent repeated memory-save loops, the model is offered `save_memory` at
+most until its first result in each human turn (saved, unchanged, or rejected).
+After that, the same model can answer or call the original tools, but is no
+longer offered another memory save for that turn. A new human message enables
+the memory tool again. No model, temperature, chunking, retrieval, full-history,
+or provider-plan changes were made. Lowering history/token budgets or changing
+models still requires user approval. Existing checkpoint corruption is separate.
 
 ## Opt-In Long-Term Memory
 

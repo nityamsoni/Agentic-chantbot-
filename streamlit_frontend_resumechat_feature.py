@@ -6,10 +6,11 @@ import os
 import sqlite3
 import uuid
 from contextlib import closing
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any, Iterator
 
 import streamlit as st
+from groq import RateLimitError
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.store.memory import InMemoryStore
 from user_memory import list_memories, edit_memory, delete_memory, clear_memories
@@ -366,19 +367,20 @@ def ingest_uploaded_file(uploaded_file: Any, thread_id: str) -> None:
     logger.info("ingestion_seconds=%.3f", perf_counter() - started)
 
 
-def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
+def stream_answer(user_input: str, thread_id: str, *, resume: bool = False) -> dict[str, Any]:
     """Stream the unchanged graph and record client-observed latency."""
     started = perf_counter()
     sources: list[dict[str, Any]] = []
     first_token: float | None = None
     answer_parts: list[str] = []
     memory_saved = False
+    failure: dict[str, Any] = {}
     status = st.status("Thinking...", expanded=False)
 
     def tokens() -> Iterator[str]:
         nonlocal first_token, memory_saved
         for mode, event in backend.chatbot.stream(
-            {"messages": [HumanMessage(content=user_input)]},
+            None if resume else {"messages": [HumanMessage(content=user_input)]},
             config=build_config(thread_id), stream_mode=["messages", "updates"],
         ):
             if mode == "updates":
@@ -421,21 +423,39 @@ def stream_answer(user_input: str, thread_id: str) -> dict[str, Any]:
             error = True
             status.update(label="No answer received", state="error")
             st.warning("No answer text was returned. Please try a new conversation.")
-    except Exception:
+    except Exception as failure_error:
         error = True
-        logger.exception("chat_turn_failed")
+        reference = uuid.uuid4().hex[:8]
+        failure = {"error_reference": reference}
+        if isinstance(failure_error, RateLimitError):
+            failure.update({
+                "error_kind": "rate_limit",
+                "error_message": "Groq's rate limit was reached. Wait about a minute, then use Retry response below. Do not repeatedly resend the message.",
+                "retry_at": time() + 60,
+            })
+        logger.exception("chat_turn_failed error_reference=%s", reference)
         status.update(label="Response interrupted", state="error")
     total = perf_counter() - started
     logger.info("total_response_seconds=%.3f success=%s", total, not error)
     return {"role": "assistant", "content": "".join(answer_parts), "sources": sources,
             "timing": {"first_token": first_token, "total": total}, "error": error,
-            "memory_saved": memory_saved}
+            "memory_saved": memory_saved, **failure}
 
 
-def render_answer_details(message: dict[str, Any]) -> None:
+def render_answer_details(message: dict[str, Any], *, allow_retry: bool = False) -> None:
     render_sources(message.get("sources", []))
     if message.get("error"):
-        st.error("The response could not finish. Check your connection and API configuration. Start a new conversation if this chat cannot continue.")
+        st.error(message.get("error_message", "The response could not finish. Check your connection and API configuration. Start a new conversation if this chat cannot continue."))
+        if message.get("error_reference"):
+            st.caption(f"Error reference: {message['error_reference']}")
+        if allow_retry and message.get("error_kind") == "rate_limit":
+            if st.button("Retry response", icon=":material/refresh:",
+                         key=f"retry_{st.session_state.thread_id}_{message['error_reference']}"):
+                remaining = message.get("retry_at", 0) - time()
+                if remaining > 0:
+                    st.warning(f"Wait another {int(remaining) + 1} seconds, then click Retry response. No request was sent.")
+                else:
+                    st.session_state.retry_response = st.session_state.thread_id
     if message.get("content"):
         with st.expander("Copy answer"):
             st.code(message["content"], language=None, wrap_lines=True)
@@ -446,11 +466,11 @@ def render_answer_details(message: dict[str, Any]) -> None:
                    else f"Total: {timing['total']:.2f}s | No text received")
 
 
-def render_composer(thread_id: str) -> Any:
+def render_composer(thread_id: str, *, disabled: bool = False) -> Any:
     """Render one PDF-enabled composer in the caller's layout context."""
     return st.chat_input(
         "Ask a question or attach a PDF", accept_file=True, file_type=["pdf"],
-        key=f"input_{thread_id}",
+        key=f"input_{thread_id}", disabled=disabled,
     )
 
 
@@ -478,14 +498,26 @@ def render_chat() -> None:
                                 for prompt in SUGGESTED_PROMPTS[index::2]:
                                     if st.button(prompt, use_container_width=True):
                                         st.session_state.pending_prompt = prompt
-            for message in history:
+            for index, message in enumerate(history):
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
                     if message["role"] == "assistant":
-                        render_answer_details(message)
+                        render_answer_details(message, allow_retry=index == len(history) - 1)
             turn = st.container()
     if had_history:
-        submission = render_composer(thread_id)
+        waiting_retry = history[-1].get("error_kind") == "rate_limit"
+        submission = render_composer(thread_id, disabled=waiting_retry)
+    if st.session_state.pop("retry_response", None) == thread_id:
+        snapshot = backend.chatbot.get_state(build_config(thread_id))
+        if "chat_node" not in snapshot.next:
+            turn.warning("This response has no pending model step to retry. Start a new conversation if needed.")
+            return
+        with turn:
+            with st.chat_message("assistant"):
+                answer = stream_answer("", thread_id, resume=True)
+                render_answer_details(answer)
+        history[-1] = answer
+        st.rerun()
     pending = st.session_state.pop("pending_prompt", None)
     if submission is None and not pending:
         return
@@ -516,7 +548,7 @@ def render_chat() -> None:
             render_answer_details(answer)
     history.append(answer)
     st.session_state.thread_titles.setdefault(thread_id, text[:40])
-    if not had_history or answer.get("memory_saved"):
+    if not had_history or answer.get("memory_saved") or answer.get("error_kind") == "rate_limit":
         st.rerun()
 
 

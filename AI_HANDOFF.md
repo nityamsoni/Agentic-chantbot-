@@ -1,6 +1,39 @@
 # Resume Chat: AI Handoff
 
-Updated: 2026-10-29.
+Updated: 2026-10-30.
+
+## Latest Incident: Groq Rate Limit
+
+The user supplied Cloud logs for the generic "response could not finish" error.
+The confirmed exception was `groq.RateLimitError` (HTTP 429), an 8,000
+tokens-per-minute quota. Supplied logs contained 18 successful model requests,
+20 HTTP 429s, and requested-token values of 2,354 and 6,250. Memory recall was
+completing. These logs do not prove which tool caused every repeated call.
+Do not diagnose this incident as an invalid key or failed Postgres store.
+
+The frontend now persists a safe rate-limit message and error reference. After
+a 60-second cooldown the user can click Retry response. It resumes a pending
+`chat_node` with null graph input, rather than appending the same HumanMessage.
+The composer is blocked while this failed answer awaits retry; new/clear chat
+is still an explicit alternative. Cooldown clicks send no request. There is
+no automatic graph retry or sleep loop; existing SDK retries are unchanged.
+
+The backend now stops offering `save_memory` after the first save tool result
+in a human turn, including rejection/no-op, to prevent repeated save attempts.
+The model and original tools remain available. A new user message re-enables
+memory saving. This is a guard against one possible source of repeated calls,
+not proof that it was the only source of the supplied quota failure.
+
+Four regression tests were added: sanitized 429 messages, cooldown/resume UI,
+one memory-save offer per user turn, and real checkpoint resume without replay
+of completed memory writes. The suite now contains 26 tests; consult the most
+recent run before claiming a pass. No history trimming, model/temperature
+change, paid quota upgrade, or new dependency was introduced.
+
+Deploy both backend and frontend and reboot to load the new cached backend.
+RAM-only memory is lost on reboot; Postgres-backed memory is separate from the
+chat checkpointer. Waiting cannot solve a single request larger than its limit,
+and other users of the same provider account may exhaust shared quota again.
 
 ## Latest Update: Opt-In User Memory
 

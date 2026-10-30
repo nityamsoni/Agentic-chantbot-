@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 import streamlit as st
+import httpx
+from groq import RateLimitError
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from streamlit.testing.v1 import AppTest
 from langgraph.store.memory import InMemoryStore
@@ -239,6 +241,58 @@ class FrontendTests(unittest.TestCase):
         self.assert_clean()
         self.assertTrue(self.app.error)
         self.assertTrue(self.app.session_state["message_history"][-1]["error"])
+
+    def test_rate_limit_has_actionable_safe_message(self) -> None:
+        self.login()
+
+        def limited_stream(*args, **kwargs):
+            request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+            response = httpx.Response(429, request=request, headers={"retry-after": "2"})
+            raise RateLimitError("private-provider-details", response=response, body={"error": {"code": "rate_limit_exceeded"}})
+            yield
+
+        self.graph.stream = limited_stream
+        with self.assertLogs(level=logging.ERROR):
+            self.app.chat_input[0].set_value("Hello").run()
+        self.assert_clean()
+        error_text = " ".join(error.value for error in self.app.error)
+        self.assertIn("rate limit", error_text.lower())
+        self.assertNotIn("private-provider-details", error_text)
+        self.assertTrue(self.app.session_state["message_history"][-1]["error"])
+
+    def test_rate_limit_retry_resumes_without_duplicate_user_input(self) -> None:
+        self.login()
+        calls = []
+
+        def limited_once(state, config, stream_mode):
+            calls.append(state)
+            if state is not None:
+                self.graph.messages[config["configurable"]["thread_id"]] = state["messages"]
+                response = httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com"))
+                raise RateLimitError("private-details", response=response, body={})
+            yield "messages", (AIMessageChunk(content="Retried successfully."), {})
+
+        self.graph.stream = limited_once
+        self.graph.get_state = lambda config: SimpleNamespace(next=("chat_node",), values={"messages": []})
+        with self.assertLogs(level=logging.ERROR):
+            self.app.chat_input[0].set_value("Hello").run()
+        self.assert_clean()
+        self.assertTrue(self.app.chat_input[0].disabled)
+        next(button for button in self.app.button if button.label == "Retry response").click().run()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.app.warning)
+        history = self.app.session_state["message_history"]
+        history[-1]["retry_at"] = 0
+        self.app.session_state["message_history"] = history
+        next(button for button in self.app.button if button.label == "Retry response").click().run()
+        self.assert_clean()
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[-1])
+        self.assertEqual(len(self.app.session_state["message_history"]), 2)
+        self.assertEqual(self.app.session_state["message_history"][-1]["content"], "Retried successfully.")
+        self.assertFalse(self.app.chat_input[0].disabled)
+        self.assertEqual(sum(isinstance(message, HumanMessage)
+                             for message in self.graph.messages[self.app.session_state["thread_id"]]), 1)
 
     def test_checkpoint_database_error(self) -> None:
         def broken_history():
