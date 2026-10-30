@@ -1,4 +1,4 @@
-# Resume Chat
+# Agentic RAG Chatbot with Long-Term Memory
 
 ## Run
 

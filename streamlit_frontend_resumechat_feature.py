@@ -14,8 +14,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.store.memory import InMemoryStore
 from user_memory import list_memories, edit_memory, delete_memory, clear_memories
 
+APP_TITLE = "Agentic RAG Chatbot"
+APP_SUBTITLE = "Long-Term Memory"
+
 st.set_page_config(
-    page_title="Resume Chat", page_icon=":material/description:",
+    page_title=f"{APP_TITLE} | {APP_SUBTITLE}", page_icon=":material/description:",
     layout="wide", initial_sidebar_state="expanded",
 )
 
@@ -120,8 +123,8 @@ def render_auth() -> None:
     """Render account forms without importing embedding or model resources."""
     with st.container(horizontal_alignment="center"):
         with st.container(width=480):
-            st.title("Resume Chat")
-            st.caption("Your resume. Your next opportunity.")
+            st.title(APP_TITLE)
+            st.caption(APP_SUBTITLE)
             mode = st.segmented_control("Account", ["Login", "Register"], default="Login")
             if mode == "Register":
                 with st.form("register_form"):
@@ -263,7 +266,7 @@ def render_sources(sources: list[dict[str, Any]]) -> None:
 
 def render_sidebar(user: dict[str, Any]) -> None:
     with st.sidebar:
-        st.header("Resume Chat")
+        st.header(APP_TITLE)
         st.caption(user["name"])
         if st.button("New conversation", icon=":material/add:", use_container_width=True, type="primary"):
             reset_chat(user["id"])
@@ -459,7 +462,8 @@ def render_chat() -> None:
     submission = None
     with st.container(horizontal_alignment="center"):
         with st.container(width=900):
-            st.title("Resume Chat")
+            st.title(APP_TITLE)
+            st.caption(APP_SUBTITLE)
             doc = st.session_state.ingested_docs.get(thread_id)
             doc_status = st.empty()
             doc_status.caption(f"{doc['filename']} | {doc['documents']} pages" if doc else "No PDF attached")

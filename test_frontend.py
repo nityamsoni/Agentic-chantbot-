@@ -99,6 +99,7 @@ class FrontendTests(unittest.TestCase):
     def test_auth_forms_and_registration(self) -> None:
         self.app.run()
         self.assert_clean()
+        self.assertEqual(self.app.title[0].value, "Agentic RAG Chatbot")
         self.app.segmented_control[0].set_value("Register").run()
         for field, value in zip(self.app.text_input, ("Test User", "test@example.com", "123456789", "testing-password")):
             field.set_value(value)
